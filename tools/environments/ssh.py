@@ -1,3 +1,4 @@
+from __future__ import annotations
 """SSH remote execution environment with ControlMaster connection persistence."""
 
 import logging
@@ -9,6 +10,7 @@ from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _popen_bash
 from tools.environments.file_sync import FileSyncManager, iter_sync_files, quoted_rm_command
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 

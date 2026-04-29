@@ -19,6 +19,7 @@ References:
   Gayler (2004) — Vector Symbolic Architectures answer Jackendoff's challenges
 """
 
+from __future__ import annotations
 import hashlib
 import logging
 import struct

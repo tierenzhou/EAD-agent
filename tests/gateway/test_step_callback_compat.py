@@ -5,6 +5,7 @@ Verifies that the gateway's step_callback normalization keeps
 while also providing the enriched ``tools`` list with results.
 """
 
+from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 

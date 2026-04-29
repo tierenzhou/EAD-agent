@@ -6,6 +6,7 @@ that can be copy-pasted into Discord/GitHub/Telegram for support context.
 No ANSI colors, no checkmarks — just data.
 """
 
+from __future__ import annotations
 import json
 import os
 import platform

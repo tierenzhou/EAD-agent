@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 """File Tools Module - LLM agent file manipulation tools."""
 
@@ -729,6 +730,7 @@ FILE_TOOLS = [
 # Schemas + Registry
 # ---------------------------------------------------------------------------
 from tools.registry import registry, tool_error
+from typing import Optional
 
 
 def _check_file_reqs():

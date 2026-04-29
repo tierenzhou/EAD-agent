@@ -1,3 +1,5 @@
+from __future__ import annotations
+from __future__ import annotations
 """Clipboard image extraction for macOS, Windows, Linux, and WSL2.
 
 Provides a single function `save_clipboard_image(dest)` that checks the
@@ -18,6 +20,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 

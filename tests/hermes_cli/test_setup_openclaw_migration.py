@@ -1,5 +1,6 @@
 """Tests for OpenClaw migration integration in the setup wizard."""
 
+from __future__ import annotations
 from argparse import Namespace
 from types import ModuleType
 from unittest.mock import MagicMock, patch

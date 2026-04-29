@@ -1,9 +1,11 @@
+from __future__ import annotations
 """Tests for the central command registry and autocomplete."""
 
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
 from hermes_cli.commands import (
+from typing import Optional
     COMMAND_REGISTRY,
     COMMANDS,
     COMMANDS_BY_CATEGORY,

@@ -5,6 +5,7 @@ Stdlib-only. All output is JSON for agent parsing.
 Data file: $HERMES_HOME/skills/productivity/memento-flashcards/data/cards.json
 """
 
+from __future__ import annotations
 import argparse
 import csv
 import json

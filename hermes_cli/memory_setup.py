@@ -1,3 +1,4 @@
+from __future__ import annotations
 """hermes memory setup|status — configure memory provider plugins.
 
 Auto-detects installed memory providers via the plugin system.
@@ -13,6 +14,7 @@ import sys
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from typing import Optional
 
 
 # ---------------------------------------------------------------------------

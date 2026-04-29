@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Tool result persistence -- preserves large outputs instead of truncating.
 
 Defense against context-window overflow operates at three levels:

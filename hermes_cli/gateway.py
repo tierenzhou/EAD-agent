@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Daytona cloud execution environment.
 
 Uses the Daytona Python SDK to run commands in cloud sandboxes.
@@ -17,6 +18,7 @@ from tools.environments.base import (
     _ThreadedProcessHandle,
 )
 from tools.environments.file_sync import FileSyncManager, iter_sync_files, quoted_rm_command
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Local execution environment — spawn-per-call with session snapshot."""
 
 import os
@@ -8,6 +9,7 @@ import subprocess
 import tempfile
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
+from typing import Optional
 
 _IS_WINDOWS = platform.system() == "Windows"
 

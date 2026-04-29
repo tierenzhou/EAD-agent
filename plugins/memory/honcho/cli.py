@@ -1,3 +1,4 @@
+from __future__ import annotations
 """CLI commands for Honcho integration management.
 
 Handles: hermes honcho setup | status | sessions | map | peer
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 from plugins.memory.honcho.client import resolve_active_host, resolve_config_path, HOST
+from typing import Optional
 
 
 def clone_honcho_for_profile(profile_name: str) -> bool:

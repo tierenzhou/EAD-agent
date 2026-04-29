@@ -1,4 +1,5 @@
 """Tests for subprocess.run() timeout coverage in CLI utilities."""
+from __future__ import annotations
 import ast
 from pathlib import Path
 

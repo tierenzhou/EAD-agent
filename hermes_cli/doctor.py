@@ -4,6 +4,7 @@ Doctor command for hermes CLI.
 Diagnoses issues with Hermes Agent setup.
 """
 
+from __future__ import annotations
 import os
 import sys
 import subprocess

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import uuid
 from abc import ABC, abstractmethod
+from typing import Optional
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)

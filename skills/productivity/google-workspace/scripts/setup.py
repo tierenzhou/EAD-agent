@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 """Google Workspace OAuth2 setup for Hermes Agent.
 
@@ -27,6 +28,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 try:
     from hermes_constants import display_hermes_home, get_hermes_home

@@ -7,6 +7,7 @@ These tests exercise end-to-end flows through the webhook adapter:
 4. GitHub comment delivery invokes ``gh`` CLI (mocked subprocess)
 """
 
+from __future__ import annotations
 import asyncio
 import hashlib
 import hmac

@@ -1,3 +1,5 @@
+from __future__ import annotations
+from __future__ import annotations
 """hermes claw — OpenClaw migration commands.
 
 Usage:
@@ -17,6 +19,7 @@ from pathlib import Path
 from hermes_cli.config import get_hermes_home, get_config_path, load_config, save_config
 from hermes_constants import get_optional_skills_dir
 from hermes_cli.setup import (
+from typing import Optional
     Colors,
     color,
     print_header,

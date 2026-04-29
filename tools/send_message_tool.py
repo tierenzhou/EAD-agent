@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Send Message Tool -- cross-channel messaging via platform APIs.
 
 Sends a message to a user or channel on any connected messaging platform
@@ -1037,6 +1038,7 @@ def _check_send_message():
 
 # --- Registry ---
 from tools.registry import registry, tool_error
+from typing import Optional
 
 registry.register(
     name="send_message",

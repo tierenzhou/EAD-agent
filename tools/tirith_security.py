@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Tirith pre-exec security scanning wrapper.
 
 Runs the tirith binary as a subprocess to scan commands for content-level
@@ -35,6 +36,7 @@ import time
 import urllib.request
 
 from hermes_constants import get_hermes_home
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 

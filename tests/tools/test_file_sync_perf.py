@@ -7,6 +7,7 @@ Requires backends to be configured (SSH host, Modal creds, etc).
 Skip markers gate each backend.
 """
 
+from __future__ import annotations
 import statistics
 import time
 

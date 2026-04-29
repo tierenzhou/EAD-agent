@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Credential-pool auth subcommands."""
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from agent.credential_pool import (
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import PROVIDER_REGISTRY
 from hermes_constants import OPENROUTER_BASE_URL
+from typing import Optional
 
 
 # Providers that support OAuth login in addition to API keys.

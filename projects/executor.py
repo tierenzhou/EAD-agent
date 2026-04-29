@@ -391,10 +391,9 @@ class ProjectExecutor:
         pct = execution.progress_percentage or 0
         steps_total = getattr(execution, "total_test_steps", None) or 0
         steps_done = (
-            getattr(execution, "succeeded_test_steps", None)
-            or 0 + getattr(execution, "failed_test_steps", None)
-            or 0 + getattr(execution, "skipped_test_steps", None)
-            or 0
+            (getattr(execution, "succeeded_test_steps", None) or 0)
+            + (getattr(execution, "failed_test_steps", None) or 0)
+            + (getattr(execution, "skipped_test_steps", None) or 0)
         )
 
         db = self._pool._get_session_db()

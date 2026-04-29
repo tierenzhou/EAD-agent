@@ -1,5 +1,6 @@
 """Tests for Discord message reactions tied to processing lifecycle hooks."""
 
+from __future__ import annotations
 import asyncio
 import sys
 from types import SimpleNamespace

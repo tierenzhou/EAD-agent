@@ -41,6 +41,7 @@ import socket
 import sys
 import threading
 import webbrowser
+from typing import Optional
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any

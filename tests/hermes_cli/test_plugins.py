@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
 import logging
@@ -11,6 +12,7 @@ import pytest
 import yaml
 
 from hermes_cli.plugins import (
+from typing import Optional
     ENTRY_POINTS_GROUP,
     VALID_HOOKS,
     LoadedPlugin,

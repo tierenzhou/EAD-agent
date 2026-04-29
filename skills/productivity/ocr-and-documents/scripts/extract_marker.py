@@ -13,6 +13,7 @@ Usage:
     python extract_marker.py document.pdf --json        # Structured output
     python extract_marker.py document.pdf --use_llm     # LLM-boosted accuracy
 """
+from __future__ import annotations
 import sys
 import os
 

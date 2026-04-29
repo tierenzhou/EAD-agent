@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 SQLite-backed fact store with entity resolution and trust scoring.
 Single-user Hermes memory store plugin.
@@ -7,6 +8,7 @@ import re
 import sqlite3
 import threading
 from pathlib import Path
+from typing import Optional
 
 try:
     from . import holographic as hrr

@@ -15,6 +15,7 @@ path first, and on ConnectTimeout / ConnectError fall through to configured
 fallback IPs in order, then "stick" to whichever IP works.
 """
 
+from __future__ import annotations
 import httpx
 import pytest
 

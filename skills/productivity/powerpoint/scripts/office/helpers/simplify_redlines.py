@@ -10,6 +10,7 @@ Rules:
 - Only merges if truly adjacent (only whitespace between them)
 """
 
+from __future__ import annotations
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path

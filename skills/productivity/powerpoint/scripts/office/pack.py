@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Pack a directory into a DOCX, PPTX, or XLSX file.
 
 Validates with auto-repair, condenses XML formatting, and creates the Office file.
@@ -20,6 +21,7 @@ from pathlib import Path
 import defusedxml.minidom
 
 from validators import DOCXSchemaValidator, PPTXSchemaValidator, RedliningValidator
+from typing import Optional
 
 def pack(
     input_directory: str,

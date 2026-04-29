@@ -20,6 +20,7 @@ Usage:
     python scripts/release.py --bump minor --publish --date 2026.3.15
 """
 
+from __future__ import annotations
 import argparse
 import re
 import shutil

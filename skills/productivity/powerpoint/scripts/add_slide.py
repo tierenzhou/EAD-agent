@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Add a new slide to an unpacked PPTX directory.
 
 Usage: python add_slide.py <unpacked_dir> <source>
@@ -22,6 +23,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
+from typing import Optional
 
 
 def get_next_slide_number(slides_dir: Path) -> int:

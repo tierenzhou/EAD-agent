@@ -1,3 +1,4 @@
+from __future__ import annotations
 """CLI presentation -- spinner, kawaii faces, tool preview formatting.
 
 Pure display functions and classes with no AIAgent dependency.
@@ -13,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from difflib import unified_diff
 from pathlib import Path
+from typing import Optional
 
 # ANSI escape codes for coloring tool failure indicators
 _RED = "\033[31m"

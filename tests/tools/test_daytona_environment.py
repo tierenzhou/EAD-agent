@@ -1,5 +1,6 @@
 """Unit tests for the Daytona cloud sandbox environment backend."""
 
+from __future__ import annotations
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, PropertyMock

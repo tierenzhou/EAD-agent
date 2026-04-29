@@ -12,6 +12,7 @@ Tests cover:
 - Error handling (invalid JSON, missing fields)
 """
 
+from __future__ import annotations
 import json
 import time
 import uuid

@@ -15,6 +15,7 @@ Any of the ~100 popular imgflip templates can also be used by name or ID —
 unknown templates get smart default text positioning based on their box_count.
 """
 
+from __future__ import annotations
 import json
 import os
 import sys

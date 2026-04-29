@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Tests for the config.yaml → env var bridge logic in gateway/run.py.
 
 Specifically tests that top-level `cwd:` and `backend:` in config.yaml
@@ -12,6 +13,7 @@ asserting the expected env var outcomes.
 import os
 import json
 import pytest
+from typing import Optional
 
 
 def _simulate_config_bridge(cfg: dict, initial_env: Optional[dict] = None):
