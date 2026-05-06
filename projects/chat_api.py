@@ -116,15 +116,16 @@ class ChatControlHandlers:
         if not session_id:
             session_id = self._create_project_session(db, session_key)
 
-        db.append_message(
-            session_id=session_id,
-            role="user",
-            content=content,
-        )
-        logger.info("[chat] Sent user message to session %s (deliver=%s)", session_key, deliver)
-
         if not deliver:
+            db.append_message(
+                session_id=session_id,
+                role="user",
+                content=content,
+            )
+            logger.info("[chat] Stored user message to session %s (deliver=%s)", session_key, deliver)
             return _json_response({"sent": True, "deliver": False, "session_key": session_key})
+
+        logger.info("[chat] Sent user message to agent for session %s (deliver=%s)", session_key, deliver)
 
         if self._agent_pool is None:
             return _json_response(

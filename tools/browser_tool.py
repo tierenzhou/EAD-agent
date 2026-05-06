@@ -1634,26 +1634,47 @@ def browser_console(
     console_result = _run_browser_command(effective_task_id, "console", console_args)
     errors_result = _run_browser_command(effective_task_id, "errors", error_args)
 
+    # Keep console payload bounded so model providers don't fail on oversized
+    # tool-result output during long runs.
+    max_messages = 40
+    max_errors = 20
+    max_entry_chars = 320
     messages = []
     if console_result.get("success"):
-        for msg in console_result.get("data", {}).get("messages", []):
+        raw_messages = console_result.get("data", {}).get("messages", []) or []
+        trimmed_messages = raw_messages[-max_messages:]
+        omitted_messages = max(0, len(raw_messages) - len(trimmed_messages))
+        for msg in trimmed_messages:
+            text = str(msg.get("text", ""))
+            if len(text) > max_entry_chars:
+                text = f"{text[:max_entry_chars]}…"
             messages.append(
                 {
                     "type": msg.get("type", "log"),
-                    "text": msg.get("text", ""),
+                    "text": text,
                     "source": "console",
                 }
             )
+    else:
+        omitted_messages = 0
 
     errors = []
     if errors_result.get("success"):
-        for err in errors_result.get("data", {}).get("errors", []):
+        raw_errors = errors_result.get("data", {}).get("errors", []) or []
+        trimmed_errors = raw_errors[-max_errors:]
+        omitted_errors = max(0, len(raw_errors) - len(trimmed_errors))
+        for err in trimmed_errors:
+            text = str(err.get("message", ""))
+            if len(text) > max_entry_chars:
+                text = f"{text[:max_entry_chars]}…"
             errors.append(
                 {
-                    "message": err.get("message", ""),
+                    "message": text,
                     "source": "exception",
                 }
             )
+    else:
+        omitted_errors = 0
 
     return json.dumps(
         {
@@ -1662,6 +1683,8 @@ def browser_console(
             "js_errors": errors,
             "total_messages": len(messages),
             "total_errors": len(errors),
+            "omitted_messages": omitted_messages,
+            "omitted_errors": omitted_errors,
         },
         ensure_ascii=False,
     )

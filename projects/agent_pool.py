@@ -123,6 +123,35 @@ class SessionAgentPool:
                 conversation_history=conversation_history,
                 task_id=f"eadproj:{session_key}",
             )
+            final_response = ""
+            completed = False
+            if isinstance(result, dict):
+                final_response = str(result.get("final_response") or "").strip()
+                completed = bool(result.get("completed"))
+                if not final_response:
+                    err = str(result.get("error") or "").strip()
+                    if err:
+                        lower_err = err.lower()
+                        # Treat provider output-length truncation as recoverable.
+                        # The executor will issue follow-up turns automatically.
+                        if "truncated due to output length limit" in lower_err or (
+                            "truncated" in lower_err and "output length" in lower_err
+                        ):
+                            logger.warning(
+                                "[agent_pool] Session %s hit output truncation; deferring recovery to next turn",
+                                session_key,
+                            )
+                            usage = {
+                                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                            }
+                            return {"result": result, "usage": usage}
+                        raise RuntimeError(err)
+                    if not completed:
+                        raise RuntimeError(
+                            "Agent run did not complete and produced no final response."
+                        )
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -158,6 +187,52 @@ class SessionAgentPool:
                 )
                 return result
             except Exception as e:
+                try:
+                    sid = session_id or self._resolve_session_id(session_key)
+                    db = self._get_session_db()
+                    if sid and db:
+                        raw_err = str(e).strip()
+                        lowered = raw_err.lower()
+                        is_credit_error = (
+                            "402" in lowered
+                            or "insufficient balance" in lowered
+                            or "quota" in lowered
+                            or "credit" in lowered
+                        )
+                        no_final_response = (
+                            "did not complete and produced no final response" in lowered
+                        )
+                        # Surface backend model/provider failures to end users with actionable guidance.
+                        if is_credit_error:
+                            user_msg = (
+                                "⚠️ Agent execution error: model/provider call failed.\n"
+                                f"Details: {raw_err[:260]}\n"
+                                "Likely cause: provider credits/quota exhausted. "
+                                "Please verify balance/quota and model access."
+                            )
+                        elif no_final_response:
+                            user_msg = (
+                                "⚠️ Agent execution error: provider returned no final response.\n"
+                                f"Details: {raw_err[:260]}\n"
+                                "Likely cause: transient provider timeout/stream interruption. "
+                                "Please retry the run or switch provider/model."
+                            )
+                        else:
+                            user_msg = (
+                                "⚠️ Agent execution error: model/provider call failed.\n"
+                                f"Details: {raw_err[:260]}\n"
+                                "Please retry. If this persists, verify provider endpoint/model configuration."
+                            )
+                        db.append_message(
+                            session_id=sid,
+                            role="assistant",
+                            content=user_msg,
+                        )
+                except Exception:
+                    logger.warning(
+                        "[agent_pool] Failed to append user-facing error message for session %s",
+                        session_key,
+                    )
                 logger.error(
                     "[agent_pool] Async run %s failed for session %s: %s",
                     run_id,

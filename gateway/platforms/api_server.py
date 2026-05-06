@@ -174,7 +174,7 @@ class ResponseStore:
 # ---------------------------------------------------------------------------
 
 _CORS_HEADERS = {
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
 }
 
@@ -1883,10 +1883,12 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 from projects.api import ProjectHandlers
                 from projects.store import ProjectStore
+                from projects.tools import register_project_tools
 
                 self._project_store = ProjectStore()
                 self._project_handlers = ProjectHandlers(store=self._project_store)
                 self._project_handlers.register_routes(self._app)
+                register_project_tools(self._project_store)
                 logger.info("[api_server] Project API endpoints registered")
             except Exception as e:
                 logger.warning("[api_server] Project API not available: %s", e)
@@ -1906,6 +1908,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         agent_pool=self._agent_pool,
                     )
                     self._project_handlers._executor = self._executor
+                    asyncio.create_task(self._executor.resume_active_executions())
                     logger.info("[api_server] ProjectExecutor wired (store + agent_pool)")
             except Exception as e:
                 logger.warning("[api_server] Chat control API not available: %s", e)

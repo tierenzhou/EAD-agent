@@ -91,8 +91,11 @@ class TestCaseRun(BaseModel):
 class EadFmNodeRun(BaseModel):
     node_id: str
     node_key: str = ""
+    parent_node_key: Optional[str] = None
+    level: int = 0
     type: str = ""
     title: str = ""
+    meta: str = ""
     status: TestCaseStepRunStatus = TestCaseStepRunStatus.NO_RUN
     test_case_runs: List[TestCaseRun] = Field(default_factory=list)
 
@@ -127,10 +130,19 @@ class ProgressLogEntry(BaseModel):
     tool_input: Optional[dict] = None
 
 
+class ProjectReportArtifact(BaseModel):
+    title: str
+    filename: str
+    format: str
+    created_at: int
+    url: str
+
+
 class ProjectTemplate(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str = ""
     description: str = ""
+    explore_type: Optional[str] = None
     target_url: Optional[str] = None
     ai_prompt: str = ""
     auth_mode: Optional[ProjectAuthMode] = None
@@ -162,6 +174,7 @@ class ProjectExecute(BaseModel):
     time_budget_minutes: Optional[int] = None
     cost_budget_dollars: Optional[float] = None
     show_local_browser: bool = False
+    explore_type: Optional[str] = None
     run_session_key: Optional[str] = None
     agent_run_id: Optional[str] = None
     status: ExecutionStatus = ExecutionStatus.PENDING
@@ -177,6 +190,7 @@ class ProjectExecute(BaseModel):
     cancel_reason: Optional[str] = None
     operator_stop_kind: Optional[str] = None
     results: List[EadFmNodeRun] = Field(default_factory=list)
+    reports: List[ProjectReportArtifact] = Field(default_factory=list)
     progress_log: List[ProgressLogEntry] = Field(default_factory=list)
     progress_log_seq: Optional[int] = None
     first_failed_at: Optional[int] = None

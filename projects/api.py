@@ -6,11 +6,16 @@ mirroring the RPC methods from EAD-EXP's gateway.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import mimetypes
+import os
 import re
+import shutil
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:
@@ -28,8 +33,87 @@ from projects.models import (
     ProjectTemplate,
 )
 from projects.store import ProjectStore
+from projects.pfm_artifacts import report_file_path
 
 logger = logging.getLogger(__name__)
+_IMAGE_PATH_RE = re.compile(r"(?:MEDIA:)?(?P<path>/[^\s`\"']+\.(?:png|jpe?g|gif|webp))", re.IGNORECASE)
+_IMAGE_BASENAME_RE = re.compile(
+    r"\b(?P<path>[\w.-]*?(?:screenshot|screen|image)[\w.-]*?\.(?:png|jpe?g|gif|webp))\b",
+    re.IGNORECASE,
+)
+_IMAGE_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp)(?:$|[?#])", re.IGNORECASE)
+_MIN_BROWSER_SCREENSHOT_BYTES = 10_000
+
+
+def _hermes_home() -> Path:
+    configured = os.getenv("HERMES_HOME", "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".hermes"
+
+
+def _resolve_local_image_path(path_text: str) -> Path:
+    src = Path(path_text).expanduser()
+    if src.exists():
+        return src
+    if src.is_absolute() or src.name != path_text:
+        return src
+    for directory in (
+        _hermes_home() / "cache" / "screenshots",
+        _hermes_home() / "browser_screenshots",
+    ):
+        candidate = directory / src.name
+        if candidate.exists():
+            return candidate
+    return src
+
+
+def _looks_like_image_ref(value: str) -> bool:
+    return bool(_IMAGE_EXT_RE.search(str(value or "").strip()))
+
+
+def _is_usable_local_image(src: Path) -> bool:
+    if not src.exists() or not src.is_file():
+        return False
+    if not _looks_like_image_ref(src.name):
+        return False
+    try:
+        size = src.stat().st_size
+    except OSError:
+        return False
+    if "browser_screenshot_" in src.name and size < _MIN_BROWSER_SCREENSHOT_BYTES:
+        return False
+    return True
+
+
+def _report_url_to_file(execution_id: str, url: str) -> Optional[Path]:
+    marker = f"/v1/projects/executions/{execution_id}/reports/"
+    text = str(url or "")
+    if marker not in text:
+        return None
+    filename = text.split(marker, 1)[1].split("?", 1)[0].split("#", 1)[0]
+    if not filename:
+        return None
+    return report_file_path(execution_id, filename)
+
+
+def _entry_has_unusable_report_image(execution_id: str, entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    for key in ("image_url", "imageUrl", "thumbnail_url", "thumbnailUrl"):
+        path = _report_url_to_file(execution_id, str(entry.get(key) or ""))
+        if path and not _is_usable_local_image(path):
+            return True
+    return False
+
+
+def _content_addressed_report_name(src: Path) -> Optional[str]:
+    try:
+        digest = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+    except OSError:
+        return None
+    suffix = src.suffix.lower()
+    if not suffix or not re.fullmatch(r"\.[a-z0-9]+", suffix):
+        suffix = ".png"
+    return f"live-shot-{digest}{suffix}"
 
 
 def _json_response(data: Any, status: int = 200) -> "web.Response":
@@ -69,6 +153,124 @@ def _to_camel_dict(data: Dict[str, Any]) -> Dict[str, Any]:
         else:
             out[camel] = v
     return out
+
+
+def _materialize_local_image_as_report(execution_id: str, image_path: str) -> Optional[str]:
+    path_text = str(image_path or "").strip()
+    if not path_text:
+        return None
+    if "\n" in path_text or "\r" in path_text or len(path_text) > 2048:
+        return None
+    src = _resolve_local_image_path(path_text)
+    if not _is_usable_local_image(src):
+        return None
+    target_name = _content_addressed_report_name(src)
+    if not target_name:
+        return None
+    target = report_file_path(execution_id, target_name)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            shutil.copy2(src, target)
+    except Exception:
+        return None
+    return f"/v1/projects/executions/{execution_id}/reports/{target_name}"
+
+
+def _extract_media_refs(content: Any) -> list[str]:
+    blobs: list[str] = []
+    if isinstance(content, str):
+        blobs.append(content)
+    elif content is not None:
+        try:
+            blobs.append(json.dumps(content, ensure_ascii=False))
+        except Exception:
+            return []
+    refs: list[str] = []
+    for blob in blobs:
+        for pattern in (_IMAGE_PATH_RE, _IMAGE_BASENAME_RE):
+            for match in pattern.finditer(blob):
+                candidate = (match.group("path") or "").strip().strip("`'\"),.;")
+                if candidate:
+                    refs.append(candidate)
+    return refs
+
+
+def _image_basename(value: str) -> str:
+    match = _IMAGE_BASENAME_RE.search(str(value or ""))
+    return match.group("path") if match else Path(str(value or "")).name
+
+
+def _has_image_named(progress_log: list[Any], name: str) -> bool:
+    if not name:
+        return False
+    for entry in progress_log:
+        if not isinstance(entry, dict):
+            continue
+        for key in ("image_url", "imageUrl", "thumbnail_url", "thumbnailUrl"):
+            if name in str(entry.get(key) or ""):
+                return True
+    return False
+
+
+def _backfill_execution_screenshots(raw: Dict[str, Any]) -> Dict[str, Any]:
+    progress_log = raw.get("progress_log") or []
+    execution_id = str(raw.get("id") or "").strip()
+    run_session_key = str(raw.get("run_session_key") or "").strip()
+    if execution_id and progress_log:
+        filtered_log = [
+            entry for entry in progress_log
+            if not _entry_has_unusable_report_image(execution_id, entry)
+        ]
+        if len(filtered_log) != len(progress_log):
+            progress_log = filtered_log
+            raw["progress_log"] = progress_log
+
+    if not execution_id or not run_session_key:
+        return raw
+
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        session = db.get_session_by_title(run_session_key)
+        if not session or not session.get("id"):
+            return raw
+        messages = db.get_messages(session["id"]) or []
+    except Exception:
+        return raw
+
+    seen_names: set[str] = set()
+    recovered_urls: list[str] = []
+    for msg in messages:
+        refs = _extract_media_refs(msg.get("content"))
+        for ref in refs:
+            name = _image_basename(ref)
+            if not name or name in seen_names or _has_image_named(progress_log, name):
+                continue
+            seen_names.add(name)
+            url = _materialize_local_image_as_report(execution_id, ref)
+            if not url:
+                continue
+            recovered_urls.append(url)
+
+    if not recovered_urls:
+        return raw
+
+    ts = time.time()
+    for url in recovered_urls[-30:]:
+        progress_log.append(
+            {
+                "ts": ts,
+                "kind": "assistant",
+                "text": "Recovered screenshot",
+                "thumbnail_url": url,
+                "image_url": url,
+            }
+        )
+        ts += 0.001
+    raw["progress_log"] = progress_log
+    return raw
 
 
 def _template_json(template) -> "web.Response":
@@ -178,6 +380,7 @@ class ProjectHandlers:
         if not execution:
             return _error_response(f"Execution {execution_id} not found", 404, "not_found")
         raw = json.loads(execution.model_dump_json())
+        raw = _backfill_execution_screenshots(raw)
         return _json_response(_to_camel_dict(raw))
 
     async def handle_run_execution(self, request: "web.Request") -> "web.Response":
@@ -202,6 +405,7 @@ class ProjectHandlers:
             description=body.get("description", template.description),
             target_url=body.get("target_url", template.target_url),
             ai_prompt=body.get("ai_prompt", template.ai_prompt),
+            explore_type=body.get("explore_type", template.explore_type),
             auth_mode=template.auth_mode,
             auth_login_url=template.auth_login_url,
             auth_session_profile=template.auth_session_profile,
@@ -217,6 +421,7 @@ class ProjectHandlers:
         logger.info("[projects] Created execution %s for template %s", execution.id, template.id)
 
         session_key = f"eadproj-exec-{created.id}"
+        session_bootstrap_ok = False
         try:
             from hermes_state import SessionDB
 
@@ -225,24 +430,26 @@ class ProjectHandlers:
             db.create_session(session_id=session_id, source="api_server", system_prompt="")
             db.set_session_title(session_id, session_key)
 
-            ai_prompt = created.ai_prompt or template.ai_prompt or ""
-            target_url = created.target_url or template.target_url or ""
-            bootstrap_msg = f"Task: {ai_prompt}"
-            if target_url:
-                bootstrap_msg += f"\n\nTarget URL: {target_url}"
-
-            db.append_message(session_id=session_id, role="user", content=bootstrap_msg)
             logger.info(
                 "[projects] Bootstrapped session %s for execution %s", session_id, created.id
             )
 
             self._store.update_execution(created.id, run_session_key=session_key)
+            session_bootstrap_ok = True
         except Exception as e:
             logger.warning(
                 "[projects] Session bootstrap failed for execution %s: %s", created.id, e
             )
+            updated = self._store.update_execution(
+                created.id,
+                status=ExecutionStatus.FAILED,
+                last_error_message=f"Run session bootstrap failed: {str(e)[:180]}",
+                executor_hint="AI Failed",
+            )
+            if updated:
+                created = updated
 
-        if self._executor:
+        if self._executor and session_bootstrap_ok:
             try:
                 loop = asyncio.get_running_loop()
                 loop.create_task(self._executor.start_execution(created.id))
@@ -270,23 +477,43 @@ class ProjectHandlers:
         final_status = (
             ExecutionStatus.COMPLETED if stop_kind == "finish" else ExecutionStatus.CANCELLED
         )
-        updated = self._store.update_execution(
-            execution_id,
-            status=final_status,
-            paused=False,
-            operator_stop_kind=stop_kind,
-            cancel_reason=cancel_reason,
-            duration_ms=int(time.time() * 1000) - (execution.start_time or int(time.time() * 1000)),
-        )
+        duration_ms = int(time.time() * 1000) - (execution.start_time or int(time.time() * 1000))
 
         if self._executor:
-            if stop_kind == "finish":
-                self._executor._cancelled.add(execution_id)
-            await self._executor.cancel_execution(execution_id)
+            await self._executor.cancel_execution(
+                execution_id,
+                final_status=final_status,
+                operator_stop_kind=stop_kind,
+                cancel_reason=cancel_reason,
+            )
+            updated = self._store.update_execution(execution_id, duration_ms=duration_ms)
+        else:
+            updated = self._store.update_execution(
+                execution_id,
+                status=final_status,
+                paused=False,
+                operator_stop_kind=stop_kind,
+                cancel_reason=cancel_reason,
+                duration_ms=duration_ms,
+            )
 
         logger.info("[projects] Cancelled execution %s (kind=%s)", execution_id, stop_kind)
         raw = json.loads(updated.model_dump_json())
         return _json_response(_to_camel_dict(raw))
+
+    async def handle_get_execution_report(self, request: "web.Request") -> "web.Response":
+        execution_id = request.match_info["execution_id"]
+        filename = Path(request.match_info["filename"]).name
+        execution = self._store.get_execution(execution_id)
+        if not execution:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+
+        target = report_file_path(execution_id, filename)
+        if not target.exists() or not target.is_file():
+            return _error_response(f"Report {filename} not found", 404, "not_found")
+
+        content_type, _ = mimetypes.guess_type(str(target))
+        return web.FileResponse(path=target, headers={"Content-Type": content_type or "text/plain"})
 
     async def handle_pause_execution(self, request: "web.Request") -> "web.Response":
         execution_id = request.match_info["execution_id"]
@@ -341,4 +568,8 @@ class ProjectHandlers:
         )
         app.router.add_post(
             "/v1/projects/executions/{execution_id}/resume", self.handle_resume_execution
+        )
+        app.router.add_get(
+            "/v1/projects/executions/{execution_id}/reports/{filename}",
+            self.handle_get_execution_report,
         )
