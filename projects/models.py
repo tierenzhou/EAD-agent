@@ -7,9 +7,12 @@ Port of src/projects/types.ts from EAD-EXP into Pydantic v2 models.
 import time
 import uuid
 from enum import Enum
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+RunPurpose = Literal["live_app_learning", "live_app_testing", "document_analysis"]
+EvidenceSource = Literal["live_app", "document", "hybrid"]
 
 
 class ProjectType(str, Enum):
@@ -194,6 +197,17 @@ class ProjectExecute(BaseModel):
     progress_log: List[ProgressLogEntry] = Field(default_factory=list)
     progress_log_seq: Optional[int] = None
     first_failed_at: Optional[int] = None
+    # Template knowledge subsystem (Phase 1). None = legacy row before these fields.
+    run_purpose: Optional[RunPurpose] = None
+    contributes_to_learning: Optional[bool] = None
+    evidence_source: Optional[EvidenceSource] = None
+    learning_exclusion_reason: Optional[str] = None
+    # Operator-controlled validity. False means this run must not be used for
+    # data reporting, inherited training context, or template current reports.
+    valid_for_data_reporting_training: Optional[bool] = None
+    invalid_for_data_reporting_training_reason: Optional[str] = None
+    # When this run was seeded from another execution's PFM artifacts / chat cache.
+    inherited_from_execution_id: Optional[str] = None
 
 
 class ProjectsStoreFile(BaseModel):

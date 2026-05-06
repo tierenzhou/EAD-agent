@@ -10,6 +10,7 @@ Exposes an HTTP server with endpoints:
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - GET  /health                     — health check
+- GET  /                           — short JSON service index (no HTML UI at this port)
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
 AnythingLLM, NextChat, ChatBox, etc.) can connect to hermes-agent
@@ -539,6 +540,22 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
+
+    async def _handle_root(self, request: "web.Request") -> "web.Response":
+        """GET / — Hermes API has no HTML UI; avoid bare 404 when operators open the base URL."""
+        return web.json_response(
+            {
+                "service": "hermes-gateway",
+                "message": "API is running. There is no web app at this path — use EAD ExpUI or call API routes below.",
+                "links": {
+                    "health": "/health",
+                    "health_v1": "/v1/health",
+                    "models": "/v1/models",
+                    "projects_executions": "/v1/projects/executions",
+                    "projects_templates": "/v1/projects/templates",
+                },
+            }
+        )
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
@@ -1860,6 +1877,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ]
             self._app = web.Application(middlewares=mws)
             self._app["api_server_adapter"] = self
+            self._app.router.add_get("/", self._handle_root)
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)

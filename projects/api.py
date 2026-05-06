@@ -5,7 +5,10 @@ Provides REST endpoints for EAD project template and execution management,
 mirroring the RPC methods from EAD-EXP's gateway.
 """
 
+from __future__ import annotations
+
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -16,7 +19,112 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
+
+_RUN_PURPOSE_ALLOWED = frozenset({"live_app_learning", "live_app_testing", "document_analysis"})
+_EVIDENCE_SOURCE_ALLOWED = frozenset({"live_app", "document", "hybrid"})
+
+
+def _coerce_request_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(int(value))
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off"):
+            return False
+    return None
+
+
+def _parse_execution_learning_metadata(body: Dict[str, Any]) -> Union[Dict[str, Any], str]:
+    """Build ProjectExecute learning fields from POST body. On error returns a message string."""
+    rp = body.get("run_purpose")
+    if rp is not None:
+        rp = str(rp).strip()
+        if rp not in _RUN_PURPOSE_ALLOWED:
+            return f"Invalid run_purpose: {rp!r} (expected one of {sorted(_RUN_PURPOSE_ALLOWED)})"
+    else:
+        rp = "live_app_learning"
+
+    contrib = _coerce_request_bool(body.get("contributes_to_learning"))
+    if contrib is None:
+        contrib = rp != "live_app_testing"
+
+    valid_reporting_training = _coerce_request_bool(body.get("valid_for_data_reporting_training"))
+    if valid_reporting_training is None:
+        valid_reporting_training = True
+    if valid_reporting_training is False:
+        contrib = False
+
+    es = body.get("evidence_source")
+    if es is not None:
+        es = str(es).strip()
+        if es not in _EVIDENCE_SOURCE_ALLOWED:
+            return f"Invalid evidence_source: {es!r} (expected one of {sorted(_EVIDENCE_SOURCE_ALLOWED)})"
+    else:
+        es = "document" if rp == "document_analysis" else "live_app"
+
+    reason_raw = body.get("learning_exclusion_reason")
+    reason: Optional[str] = None
+    if reason_raw is not None:
+        s = str(reason_raw).strip()
+        if s:
+            reason = s[:500]
+
+    return {
+        "run_purpose": rp,
+        "contributes_to_learning": contrib,
+        "evidence_source": es,
+        "learning_exclusion_reason": reason,
+        "valid_for_data_reporting_training": valid_reporting_training,
+        "invalid_for_data_reporting_training_reason": reason if valid_reporting_training is False else None,
+    }
+
+
+def _execution_ack_message(execution: ProjectExecute) -> str:
+    purpose = execution.run_purpose or "live_app_learning"
+    evidence = execution.evidence_source or "live_app"
+    learning = (
+        "will contribute to template learning"
+        if execution.contributes_to_learning is not False
+        else "will not update the template learning index"
+    )
+    target = (execution.target_url or "").strip() or "the configured target"
+    return (
+        f"## Run Introduction\n\n"
+        f"I have received the assignment for **{execution.name or 'this Explore run'}** and I am starting now.\n\n"
+        f"- Purpose: `{purpose}`\n"
+        f"- Evidence focus: `{evidence}`\n"
+        f"- Learning mode: {learning}\n"
+        f"- Target: {target}\n\n"
+        "First I will complete the login/initialization phase. After login is confirmed, "
+        "I will begin PFM discovery and report meaningful milestones with evidence.\n\n"
+        "Login evidence: I will attach at least 3 screenshots (site URL identity, login step, post-login view) "
+        "in report_running_step.thumbnail_urls before declaring login success."
+    )
+
+
+def _execution_boundary_message(execution: ProjectExecute) -> str:
+    target = (execution.target_url or "").strip() or "the configured target URL"
+    return "\n".join(
+        [
+            "HARD PROJECT TEMPLATE BOUNDARY:",
+            f"- Execution ID: {execution.id}.",
+            f"- Template ID: {execution.linked_template_id}.",
+            f"- Run name: {execution.name or execution.id}.",
+            f"- Target URL: {target}.",
+            "- Each project template is independent from all other templates.",
+            "- Do not use global memory, another template's runs, another session, or another target as evidence.",
+            "- Use only this run's live observations plus explicitly injected same-template learning context.",
+            "- Start from the Target URL. Do not navigate to remembered URLs or subdomains unless the Target URL itself redirects there.",
+            "- If remembered information conflicts with this boundary, ignore the remembered information and report only live evidence.",
+        ]
+    )
 
 try:
     from aiohttp import web
@@ -28,6 +136,7 @@ except ImportError:
 
 from projects.models import (
     ExecutionStatus,
+    ProgressLogEntry,
     ProjectAuthMode,
     ProjectExecute,
     ProjectTemplate,
@@ -43,6 +152,56 @@ _IMAGE_BASENAME_RE = re.compile(
 )
 _IMAGE_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp)(?:$|[?#])", re.IGNORECASE)
 _MIN_BROWSER_SCREENSHOT_BYTES = 10_000
+
+# Align with EAD_ExpUI src/ui/pfm-mindmap-remote-cache.ts
+_PFM_MINDMAP_REMOTE_CACHE_MARKER = "[PFM-MINDMAP-CACHE:v1]"
+
+
+def _try_inject_inherited_pfm_mindmap_cache(
+    new_session_id: str,
+    new_run_session_key: str,
+    source_execution_id: str,
+) -> bool:
+    """Copy latest PFM mindmap cache system message from source run's chat into the new session."""
+    try:
+        from hermes_state import SessionDB
+    except ImportError:
+        return False
+
+    db = SessionDB()
+    source_title = f"eadproj-exec-{source_execution_id}"
+    src_sid = db.resolve_session_by_title(source_title)
+    if not src_sid:
+        return False
+
+    messages = db.get_messages(src_sid)
+    for msg in reversed(messages):
+        if (msg.get("role") or "").lower() != "system":
+            continue
+        content = str(msg.get("content") or "").strip()
+        if not content.startswith(_PFM_MINDMAP_REMOTE_CACHE_MARKER):
+            continue
+        json_part = content[len(_PFM_MINDMAP_REMOTE_CACHE_MARKER) :].strip()
+        if not json_part:
+            continue
+        try:
+            envelope = json.loads(json_part)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(envelope, dict) or envelope.get("cleared") is True:
+            continue
+        mm = envelope.get("mindmap")
+        if not isinstance(mm, dict):
+            continue
+        mm["sessionKey"] = new_run_session_key
+        envelope["cacheKey"] = new_run_session_key
+        envelope["savedAt"] = int(time.time() * 1000)
+        new_content = _PFM_MINDMAP_REMOTE_CACHE_MARKER + "\n" + json.dumps(
+            envelope, ensure_ascii=False
+        )
+        db.append_message(new_session_id, "system", new_content)
+        return True
+    return False
 
 
 def _hermes_home() -> Path:
@@ -380,7 +539,21 @@ class ProjectHandlers:
         if not execution:
             return _error_response(f"Execution {execution_id} not found", 404, "not_found")
         raw = json.loads(execution.model_dump_json())
+        before_progress_len = len(raw.get("progress_log") or [])
         raw = _backfill_execution_screenshots(raw)
+        after_progress = raw.get("progress_log") or []
+        if len(after_progress) > before_progress_len:
+            try:
+                self._store.update_execution(
+                    execution_id,
+                    progress_log=[
+                        ProgressLogEntry.model_validate(entry)
+                        for entry in after_progress
+                        if isinstance(entry, dict)
+                    ],
+                )
+            except Exception as exc:
+                logger.warning("[projects] Failed to persist recovered screenshots for %s: %s", execution_id, exc)
         return _json_response(_to_camel_dict(raw))
 
     async def handle_run_execution(self, request: "web.Request") -> "web.Response":
@@ -399,12 +572,73 @@ class ProjectHandlers:
         if not template:
             return _error_response(f"Template {template_id} not found", 404, "not_found")
 
+        learning_meta = _parse_execution_learning_metadata(body)
+        if isinstance(learning_meta, str):
+            return _error_response(learning_meta)
+
+        inherit_pfm = _coerce_request_bool(body.get("inherit_pfm"))
+        if inherit_pfm is None:
+            inherit_pfm = True
+
+        raw_explicit = body.get("inherit_from_execution_id") or body.get("inheritFromExecutionId")
+        explicit_source_id = str(raw_explicit).strip() if raw_explicit else None
+
+        resolved_inherit_source: Optional[ProjectExecute] = None
+        if inherit_pfm and explicit_source_id:
+            resolved_inherit_source = self._store.resolve_pfm_inheritance_source(
+                template.id,
+                explicit_source_id=explicit_source_id,
+            )
+            if not resolved_inherit_source:
+                return _error_response(
+                    "inherit_from_execution_id was not found, is not for this template, "
+                    "or is not eligible for PFM inheritance",
+                    400,
+                )
+
+        base_ai_prompt = body.get("ai_prompt", template.ai_prompt)
+        inherited_context = self._store.build_template_learning_context(template.id)
+        if inherited_context:
+            base_ai_prompt = "\n\n".join(
+                [
+                    str(base_ai_prompt or "").strip(),
+                    "## Template Learning Context",
+                    (
+                        "This same-template PFM context is locked until login succeeds. "
+                        "Do not read, summarize, mention, display, or rely on it before the login checkpoint "
+                        "reports login_phase_status=success."
+                    ),
+                    inherited_context,
+                    (
+                        "Instruction after login only: reuse these prior PFM mindmap/node-report findings "
+                        "as a starting hypothesis, then improve or correct them with new evidence."
+                    ),
+                ]
+            ).strip()
+
+        isolation_context = "\n".join(
+            [
+                "## Template Isolation Rules",
+                f"- Current template ID: `{template.id}`.",
+                f"- Current template name: `{template.name}`.",
+                f"- Current target URL: `{body.get('target_url', template.target_url) or ''}`.",
+                "- Hard rule: no global knowledge and no cross-template memory. Each project template is independent.",
+                "- Do not use facts from other project templates, previous runs, or persistent memory as current evidence unless they appear in the Template Learning Context above and belong to this exact template.",
+                "- If persistent memory mentions a different target, subdomain, template, or application, ignore it unless this run rediscovers it from the current target.",
+                "- Start from the current target URL. If the browser redirects to a different domain or subdomain, report the redirect as a fresh observation; do not assume it means this run is another project.",
+                "- Build the PFM and node EAD reports from evidence collected in this run plus same-template inherited context only.",
+            ]
+        )
+        base_ai_prompt = "\n\n".join(
+            [part for part in [str(base_ai_prompt or "").strip(), isolation_context] if part]
+        ).strip()
+
         execution = ProjectExecute(
             linked_template_id=template.id,
             name=body.get("name", f"Run - {template.name}"),
             description=body.get("description", template.description),
             target_url=body.get("target_url", template.target_url),
-            ai_prompt=body.get("ai_prompt", template.ai_prompt),
+            ai_prompt=base_ai_prompt,
             explore_type=body.get("explore_type", template.explore_type),
             auth_mode=template.auth_mode,
             auth_login_url=template.auth_login_url,
@@ -415,10 +649,64 @@ class ProjectHandlers:
             show_local_browser=body.get("show_local_browser", False),
             status=ExecutionStatus.PENDING,
             start_time=int(time.time() * 1000),
+            run_purpose=learning_meta["run_purpose"],
+            contributes_to_learning=learning_meta["contributes_to_learning"],
+            evidence_source=learning_meta["evidence_source"],
+            learning_exclusion_reason=learning_meta["learning_exclusion_reason"],
+            valid_for_data_reporting_training=learning_meta["valid_for_data_reporting_training"],
+            invalid_for_data_reporting_training_reason=learning_meta[
+                "invalid_for_data_reporting_training_reason"
+            ],
         )
 
         created = self._store.create_execution(execution)
-        logger.info("[projects] Created execution %s for template %s", execution.id, template.id)
+        inherited_source_id: Optional[str] = None
+
+        if inherit_pfm:
+            src = resolved_inherit_source
+            if not src:
+                src = self._store.resolve_pfm_inheritance_source(
+                    template.id,
+                    exclude_execution_id=created.id,
+                    explicit_source_id=None,
+                )
+            if src:
+                inherited_source_id = src.id
+                try:
+                    seeded_run = self._store.seed_execution_from_prior_run(created.id, src.id)
+                    if seeded_run:
+                        created = seeded_run
+                except Exception as exc:
+                    logger.exception(
+                        "[projects] seed_execution_from_prior_run failed (exec=%s from=%s): %s",
+                        created.id,
+                        src.id,
+                        exc,
+                    )
+                    try:
+                        seeded_fallback = self._store.seed_execution_from_template_artifacts(created.id)
+                        if seeded_fallback:
+                            created = seeded_fallback
+                    except Exception as exc2:
+                        logger.exception(
+                            "[projects] Template artifact fallback seed also failed: %s", exc2
+                        )
+            else:
+                seeded = self._store.seed_execution_from_template_artifacts(created.id)
+                if seeded:
+                    created = seeded
+        else:
+            seeded = self._store.seed_execution_from_template_artifacts(created.id)
+            if seeded:
+                created = seeded
+
+        logger.info(
+            "[projects] Created execution %s for template %s (inherit_pfm=%s inherited_from=%s)",
+            created.id,
+            template.id,
+            inherit_pfm,
+            inherited_source_id,
+        )
 
         session_key = f"eadproj-exec-{created.id}"
         session_bootstrap_ok = False
@@ -427,9 +715,23 @@ class ProjectHandlers:
 
             db = SessionDB()
             session_id = f"eadproj-{uuid.uuid4().hex[:12]}"
-            db.create_session(session_id=session_id, source="api_server", system_prompt="")
+            boundary_message = _execution_boundary_message(created)
+            db.create_session(
+                session_id=session_id,
+                source="api_server",
+                system_prompt=boundary_message,
+            )
             db.set_session_title(session_id, session_key)
-
+            db.append_message(
+                session_id=session_id,
+                role="system",
+                content=boundary_message,
+            )
+            db.append_message(
+                session_id=session_id,
+                role="assistant",
+                content=_execution_ack_message(created),
+            )
             logger.info(
                 "[projects] Bootstrapped session %s for execution %s", session_id, created.id
             )
@@ -501,6 +803,55 @@ class ProjectHandlers:
         raw = json.loads(updated.model_dump_json())
         return _json_response(_to_camel_dict(raw))
 
+    async def handle_delete_execution(self, request: "web.Request") -> "web.Response":
+        execution_id = request.match_info["execution_id"]
+        execution = self._store.get_execution(execution_id)
+        if not execution:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+
+        if execution.status == ExecutionStatus.RUNNING:
+            if self._executor:
+                await self._executor.cancel_execution(
+                    execution_id,
+                    final_status=ExecutionStatus.CANCELLED,
+                    operator_stop_kind="cancel",
+                    cancel_reason="Deleted by operator",
+                )
+            else:
+                self._store.update_execution(
+                    execution_id,
+                    status=ExecutionStatus.CANCELLED,
+                    paused=False,
+                    operator_stop_kind="cancel",
+                    cancel_reason="Deleted by operator",
+                )
+
+        deleted = self._store.delete_execution(execution_id)
+        if not deleted:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+        logger.info("[projects] Deleted execution %s", execution_id)
+        return _json_response({"deleted": True, "execution_id": execution_id})
+
+    async def handle_invalidate_execution(self, request: "web.Request") -> "web.Response":
+        execution_id = request.match_info["execution_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        execution = self._store.get_execution(execution_id)
+        if not execution:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+
+        reason = str(body.get("reason") or "Not valid for data reporting and training").strip()
+        updated = self._store.invalidate_execution_learning(execution_id, reason=reason)
+        if not updated:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+
+        logger.info("[projects] Marked execution %s invalid for data reporting and training", execution_id)
+        raw = json.loads(updated.model_dump_json())
+        return _json_response(_to_camel_dict(raw))
+
     async def handle_get_execution_report(self, request: "web.Request") -> "web.Response":
         execution_id = request.match_info["execution_id"]
         filename = Path(request.match_info["filename"]).name
@@ -510,10 +861,55 @@ class ProjectHandlers:
 
         target = report_file_path(execution_id, filename)
         if not target.exists() or not target.is_file():
+            artifact = self._store.get_execution_pfm_artifact(execution_id, filename)
+            if artifact:
+                content_type, _ = mimetypes.guess_type(filename)
+                if artifact.get("content_encoding") == "base64" and artifact.get("content_base64"):
+                    try:
+                        body = base64.b64decode(str(artifact.get("content_base64")))
+                    except Exception:
+                        body = b""
+                    return web.Response(
+                        body=body,
+                        headers={"Content-Type": content_type or "application/octet-stream"},
+                    )
+                return web.Response(
+                    text=str(artifact.get("content") or ""),
+                    headers={"Content-Type": content_type or "text/plain"},
+                )
             return _error_response(f"Report {filename} not found", 404, "not_found")
 
         content_type, _ = mimetypes.guess_type(str(target))
         return web.FileResponse(path=target, headers={"Content-Type": content_type or "text/plain"})
+
+    async def handle_save_node_report_artifact(self, request: "web.Request") -> "web.Response":
+        execution_id = request.match_info["execution_id"]
+        execution = self._store.get_execution(execution_id)
+        if not execution:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+
+        try:
+            body = _to_snake_dict(await request.json())
+        except Exception:
+            return _error_response("Invalid JSON")
+
+        node_key = str(body.get("node_key") or "").strip()
+        title = str(body.get("title") or "").strip()
+        content = str(body.get("content") or "").strip()
+        if not node_key:
+            return _error_response("node_key is required")
+        if not content:
+            return _error_response("content is required")
+
+        artifact = self._store.save_node_ead_report_artifact(
+            execution_id,
+            node_key=node_key,
+            title=title,
+            content=content,
+        )
+        if not artifact:
+            return _error_response("Unable to save node report artifact")
+        return _json_response(_to_camel_dict(artifact))
 
     async def handle_pause_execution(self, request: "web.Request") -> "web.Response":
         execution_id = request.match_info["execution_id"]
@@ -559,6 +955,11 @@ class ProjectHandlers:
 
         app.router.add_get("/v1/projects/executions", self.handle_list_executions)
         app.router.add_get("/v1/projects/executions/{execution_id}", self.handle_get_execution)
+        app.router.add_delete("/v1/projects/executions/{execution_id}", self.handle_delete_execution)
+        app.router.add_post(
+            "/v1/projects/executions/{execution_id}/invalidate",
+            self.handle_invalidate_execution,
+        )
         app.router.add_post("/v1/projects/executions/run", self.handle_run_execution)
         app.router.add_post(
             "/v1/projects/executions/{execution_id}/cancel", self.handle_cancel_execution
@@ -572,4 +973,8 @@ class ProjectHandlers:
         app.router.add_get(
             "/v1/projects/executions/{execution_id}/reports/{filename}",
             self.handle_get_execution_report,
+        )
+        app.router.add_post(
+            "/v1/projects/executions/{execution_id}/artifacts/node-report",
+            self.handle_save_node_report_artifact,
         )

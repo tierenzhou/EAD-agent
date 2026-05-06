@@ -172,36 +172,57 @@ def _try_upload_to_s3(local_path: Path, execution_id: str, filename: str) -> Opt
     return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
 
 
+def build_pfm_artifact_payloads(execution: ProjectExecute) -> List[Dict]:
+    nodes = execution.results or derive_node_runs_from_progress(execution.progress_log or [])
+    created_at = int(time.time() * 1000)
+    mindmap_name = "pfm-mindmap.mmd"
+    report_name = "pfm-report.md"
+    node_payloads = [
+        node.model_dump() if hasattr(node, "model_dump") else dict(node)
+        for node in nodes
+    ]
+
+    return [
+        {
+            "artifact_key": mindmap_name,
+            "artifact_type": "pfm_mindmap",
+            "title": "PFM Mindmap (Mermaid)",
+            "filename": mindmap_name,
+            "format": "mmd",
+            "content": _build_mermaid_mindmap(execution, nodes),
+            "nodes": node_payloads,
+            "created_at": created_at,
+        },
+        {
+            "artifact_key": report_name,
+            "artifact_type": "pfm_report",
+            "title": "PFM Report (Markdown)",
+            "filename": report_name,
+            "format": "md",
+            "content": _build_markdown_report(execution, nodes),
+            "nodes": node_payloads,
+            "created_at": created_at,
+        },
+    ]
+
+
 def build_and_persist_pfm_artifacts(execution: ProjectExecute) -> List[ProjectReportArtifact]:
     base_dir = reports_root_dir() / execution.id
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    nodes = execution.results or derive_node_runs_from_progress(execution.progress_log or [])
-    mindmap_name = "pfm-mindmap.mmd"
-    report_name = "pfm-report.md"
-    mindmap_path = base_dir / mindmap_name
-    report_path = base_dir / report_name
-
-    mindmap_path.write_text(_build_mermaid_mindmap(execution, nodes), encoding="utf-8")
-    report_path.write_text(_build_markdown_report(execution, nodes), encoding="utf-8")
-
-    mindmap_url = _try_upload_to_s3(mindmap_path, execution.id, mindmap_name)
-    report_url = _try_upload_to_s3(report_path, execution.id, report_name)
-
-    created_at = int(time.time() * 1000)
-    return [
-        ProjectReportArtifact(
-            title="PFM Mindmap (Mermaid)",
-            filename=mindmap_name,
-            format="mmd",
-            created_at=created_at,
-            url=mindmap_url or f"/v1/projects/executions/{execution.id}/reports/{mindmap_name}",
-        ),
-        ProjectReportArtifact(
-            title="PFM Report (Markdown)",
-            filename=report_name,
-            format="md",
-            created_at=created_at,
-            url=report_url or f"/v1/projects/executions/{execution.id}/reports/{report_name}",
-        ),
-    ]
+    reports = []
+    for payload in build_pfm_artifact_payloads(execution):
+        filename = payload["filename"]
+        path = base_dir / filename
+        path.write_text(str(payload.get("content") or ""), encoding="utf-8")
+        uploaded_url = _try_upload_to_s3(path, execution.id, filename)
+        reports.append(
+            ProjectReportArtifact(
+                title=payload["title"],
+                filename=filename,
+                format=payload["format"],
+                created_at=int(payload["created_at"]),
+                url=uploaded_url or f"/v1/projects/executions/{execution.id}/reports/{filename}",
+            )
+        )
+    return reports

@@ -18,6 +18,45 @@ logger = logging.getLogger(__name__)
 
 _store: Optional[ProjectStore] = None
 
+_MIN_LOGIN_SUCCESS_SCREENSHOTS = 3
+
+
+def _login_checkpoint_title(title: str) -> bool:
+    return "login pfm map (interactive)" in str(title or "").strip().lower()
+
+
+def _nonempty_thumbnail_urls(thumbnail_urls) -> list:
+    if not isinstance(thumbnail_urls, list):
+        return []
+    return [u for u in thumbnail_urls if str(u).strip()]
+
+
+def _count_prior_login_steps_with_screenshots(progress_log) -> int:
+    n = 0
+    for entry in progress_log or []:
+        if entry.kind != "tool_use" or (entry.tool_name or "") != "report_running_step":
+            continue
+        ti = entry.tool_input or {}
+        if not _login_checkpoint_title(str(ti.get("title") or "")):
+            continue
+        if _nonempty_thumbnail_urls(ti.get("thumbnail_urls")):
+            n += 1
+    return n
+
+
+def _count_prior_login_evidence_screenshots(progress_log) -> int:
+    urls = set()
+    for entry in progress_log or []:
+        for attr in ("thumbnail_url", "image_url"):
+            url = getattr(entry, attr, None)
+            if url:
+                urls.add(str(url))
+        ti = entry.tool_input or {}
+        thumbs = ti.get("thumbnail_urls")
+        if isinstance(thumbs, list):
+            urls.update(str(u) for u in thumbs if str(u).strip())
+    return len(urls)
+
 
 def _get_store() -> ProjectStore:
     global _store
@@ -51,6 +90,9 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
 
         return json.dumps({
             "id": execution.id,
+            "template_id": execution.linked_template_id,
+            "name": execution.name,
+            "target_url": execution.target_url,
             "status": execution.status.value,
             "progress_percentage": execution.progress_percentage,
             "paused": execution.paused,
@@ -98,6 +140,8 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
         pfm_node = args.get("pfm_node")
         login_phase_status_raw = str(args.get("login_phase_status") or "").strip().lower()
         login_success_arg = args.get("login_success")
+        initialization_review_status = str(args.get("initialization_review_status") or "").strip().lower()
+        ready_to_explore = args.get("ready_to_explore")
         observation = str(args.get("observation") or "").strip()
         finding = str(args.get("finding") or "").strip()
         reasoning = str(args.get("reasoning") or "").strip()
@@ -107,6 +151,63 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
         execution = s.get_execution(execution_id)
         if not execution:
             return json.dumps({"error": f"Execution {execution_id} not found"})
+
+        thumbs_now = _nonempty_thumbnail_urls(thumbnail_urls)
+        claims_login_success = login_phase_status_raw == "success" or login_success_arg is True
+        if claims_login_success and _login_checkpoint_title(title):
+            login_text = " ".join(
+                str(part or "")
+                for part in (title, description, observation, finding, reasoning, decision, next_direction)
+            ).lower()
+            signup_markers = (
+                "sign up",
+                "signup",
+                "register",
+                "create account",
+                "new account",
+                "start trial",
+            )
+            signin_markers = ("sign in", "signin", "log in", "login", "logged in")
+            if any(marker in login_text for marker in signup_markers) and not any(
+                marker in login_text for marker in signin_markers
+            ):
+                return json.dumps(
+                    {
+                        "error": "login_success_must_be_signin_only",
+                        "recorded": False,
+                        "message": (
+                            "Do not complete sign-up/register/create-account flows. "
+                            "Use existing-account sign-in only, or ask the end user for the correct sign-in route "
+                            "and credentials."
+                        ),
+                    }
+                )
+            prior_shot_steps = _count_prior_login_steps_with_screenshots(execution.progress_log)
+            prior_evidence_shots = _count_prior_login_evidence_screenshots(execution.progress_log)
+            steps_with_shots = prior_shot_steps + (1 if thumbs_now else 0)
+            enough = (
+                len(thumbs_now) >= _MIN_LOGIN_SUCCESS_SCREENSHOTS
+                or steps_with_shots >= _MIN_LOGIN_SUCCESS_SCREENSHOTS
+                or prior_evidence_shots + len(thumbs_now) >= _MIN_LOGIN_SUCCESS_SCREENSHOTS
+            )
+            if not enough:
+                return json.dumps(
+                    {
+                        "error": "login_success_requires_screenshots",
+                        "recorded": False,
+                        "message": (
+                            f"Before login_phase_status=success (or login_success=true), attach at least "
+                            f"{_MIN_LOGIN_SUCCESS_SCREENSHOTS} screenshots: either include "
+                            f"{_MIN_LOGIN_SUCCESS_SCREENSHOTS}+ distinct URLs in thumbnail_urls on this call, "
+                            f"or accumulate {_MIN_LOGIN_SUCCESS_SCREENSHOTS} separate "
+                            "'Login PFM map (Interactive)' steps each with at least one screenshot. "
+                            "Typical proof: (1) URL/site identity, (2) login step, (3) post-login view."
+                        ),
+                        "login_steps_with_screenshots_so_far": prior_shot_steps,
+                        "login_evidence_screenshots_so_far": prior_evidence_shots,
+                        "thumbnails_in_this_call": len(thumbs_now),
+                    }
+                )
 
         step_num = len(execution.steps) + 1
         artifacts = [
@@ -164,6 +265,51 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                 break
 
         should_record_pfm_node = isinstance(pfm_node, dict) and login_success_before_step
+        if should_record_pfm_node and not thumbs_now:
+            return json.dumps(
+                {
+                    "error": "pfm_confirmation_requires_screenshot",
+                    "recorded": False,
+                    "message": (
+                        "Whenever you identify, update, or re-confirm a feature, function, "
+                        "functional area, or PFM node, capture a fresh screenshot and include it in "
+                        "thumbnail_urls on the same report_running_step call. This applies "
+                        "to inherited/existing nodes as well as new nodes."
+                    ),
+                }
+            )
+        if should_record_pfm_node:
+            node_title_for_validation = str(
+                pfm_node.get("title")
+                or pfm_node.get("node_key")
+                or pfm_node.get("node_id")
+                or ""
+            ).strip().lower()
+            action_node_prefixes = (
+                "click ",
+                "tap ",
+                "press ",
+                "type ",
+                "enter ",
+                "input ",
+                "select ",
+                "choose ",
+                "open dropdown",
+                "scroll ",
+                "navigate to ",
+            )
+            if any(node_title_for_validation.startswith(prefix) for prefix in action_node_prefixes):
+                return json.dumps(
+                    {
+                        "error": "pfm_node_must_be_functional_area",
+                        "recorded": False,
+                        "message": (
+                            "A PFM node must represent a functional area/capability, not a simple UI action. "
+                            "Record clicks, typing, navigation, and button presses as test steps under "
+                            "test_case_runs for the relevant functional node."
+                        ),
+                    }
+                )
         if should_record_pfm_node:
             existing_results = list(execution.results or [])
             raw_node_key = str(
@@ -261,6 +407,13 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                 else "Login confirmed; PFM discovery started"
             )
 
+        if "pfm inheritance review (initialization)" in str(title).strip().lower():
+            update_fields["executor_hint"] = (
+                "Running..."
+                if initialization_review_status == "success" or ready_to_explore is True
+                else "Reviewing previous PFM results before exploration..."
+            )
+
         s.update_execution(execution_id, **update_fields)
 
         logger.info("[ead_tools] Reported step %s for execution %s: %s", new_step.step_id, execution_id, title)
@@ -303,7 +456,11 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                 "thumbnail_urls": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Screenshot URLs captured during this step",
+                    "description": (
+                        "Screenshot URLs captured during this step. Required whenever this "
+                        "step identifies, updates, or re-confirms a feature, function, "
+                        "functional area, or PFM node, including inherited/existing nodes."
+                    ),
                 },
                 "observation": {
                     "type": "string",
@@ -327,15 +484,43 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                 },
                 "login_phase_status": {
                     "type": "string",
-                    "description": "For login checkpoint only: pending | success | failed.",
+                    "description": "For login checkpoint only: pending | success | failed. "
+                    "Existing-account sign-in only: never use sign-up, register, create-account, trial, "
+                    "or new-user onboarding flows. "
+                    "Use pending while asking the user for credentials/OTP/captcha help or waiting for UI response. "
+                    "Use success only after attaching at least 3 screenshots total (see thumbnail_urls): "
+                    "either 3+ URLs on one step, or 3+ separate login steps each with a screenshot.",
                 },
                 "login_success": {
                     "type": "boolean",
-                    "description": "Alternative explicit login success flag for the checkpoint step.",
+                    "description": "Alternative explicit login success flag for the checkpoint step. "
+                    "Only set true for existing-account sign-in, never sign-up/register/create-account flows. "
+                    "Same screenshot evidence rules as login_phase_status=success.",
+                },
+                "initialization_review_status": {
+                    "type": "string",
+                    "description": (
+                        "For post-login initialization review only: pending | success. "
+                        "Use success after reviewing inherited previous PFM results, summarizing the prior mindmap, "
+                        "and stating the plan for the assigned active exploration duration."
+                    ),
+                },
+                "ready_to_explore": {
+                    "type": "boolean",
+                    "description": (
+                        "For post-login initialization review only. Set true when sign-in is complete, "
+                        "previous results have been analyzed, and the next-run plan is ready."
+                    ),
                 },
                 "pfm_node": {
                     "type": "object",
-                    "description": "Optional structured PFM node update for mindmap progress tracking (allowed only after login success checkpoint).",
+                    "description": (
+                        "Optional structured PFM node update for mindmap progress tracking "
+                        "(allowed only after login success checkpoint). A PFM node must be "
+                        "a functional area/capability, not a simple UI action like a click, "
+                        "typing into a field, opening a dropdown, or pressing a button. If provided, "
+                        "thumbnail_urls must include fresh screenshot evidence from this run."
+                    ),
                     "properties": {
                         "node_id": {"type": "string"},
                         "node_key": {"type": "string"},
@@ -345,7 +530,11 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                         },
                         "level": {
                             "type": "integer",
-                            "description": "Hierarchy level: 1=domain, 2=feature group, 3=atomic function, 4=action.",
+                            "description": (
+                                "Hierarchy level: 1=domain, 2=functional area/PFM node, "
+                                "3=feature group or feature. Do not use action-level nodes; "
+                                "record clicks/form fills/navigation as test steps under test_case_runs."
+                            ),
                         },
                         "title": {"type": "string"},
                         "description": {
@@ -388,6 +577,7 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
 
         reports = build_and_persist_pfm_artifacts(execution)
         s.update_execution(execution_id, reports=reports)
+        s.sync_execution_pfm_artifacts_from_state(execution_id)
         return json.dumps(
             {
                 "published": True,

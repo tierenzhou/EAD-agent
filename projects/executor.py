@@ -26,6 +26,7 @@ from .pfm_artifacts import (
     derive_node_runs_from_progress,
     report_file_path,
 )
+from .pfm_deliverables import generate_pfm_deliverables
 
 
 def _cleanup_browser_for_session(session_key: str) -> None:
@@ -55,15 +56,30 @@ _STALL_INTERRUPT_S = 90.0
 _LOGIN_PHASE_PROMPT = (
     "LOGIN PHASE (MANDATORY, FIRST):\n"
     "1) Your first objective is successful login only. Do NOT start PFM discovery yet.\n"
-    "2) Find a viable login path autonomously (UI clues, navigation options, auth hints, fallback routes).\n"
-    "3) For each meaningful attempt, call report_running_step and include:\n"
+    "2) Perform existing-account SIGN IN only. Do NOT sign up, register, create a new account, start a trial, "
+    "or submit any new-user onboarding flow.\n"
+    "3) Find a viable sign-in path autonomously (UI clues, navigation options, auth hints, fallback routes). "
+    "If only sign-up/register controls are visible, report a blocker and ask the user for the correct sign-in route.\n"
+    "4) Work slowly and interactively: after each page load, form entry, submit, redirect, or error, pause long enough "
+    "to observe the UI state before deciding the next action.\n"
+    "5) Communicate with the end user during login. Report what you see, what you need, why you are waiting, "
+    "and what will happen next.\n"
+    "6) If credentials, OTP, captcha, or login/password information is missing or uncertain, stop guessing and ask "
+    "the end user for the needed information using report_running_step. Mark login_phase_status=pending.\n"
+    "7) For each meaningful attempt, call report_running_step and include:\n"
     "   - title: 'Login PFM map (Interactive)'\n"
     "   - login_phase_status: pending | failed | success\n"
     "   - login_success: true/false\n"
     "   - observation, finding, reasoning, decision, next_direction\n"
-    "4) Keep iterating until login succeeds or strong evidence indicates a blocker.\n"
-    "5) Only after login_phase_status=success may you send pfm_node updates.\n"
-    "6) If blocked, explain exactly why and propose the next best login strategy.\n"
+    "8) Keep iterating until login succeeds or strong evidence indicates a blocker.\n"
+    "9) SCREENSHOT EVIDENCE (MANDATORY BEFORE SUCCESS): Do not set login_phase_status=success until the "
+    "operator can verify you are on the correct site and login worked. Provide at least 3 screenshots by either:\n"
+    "   - three separate 'Login PFM map (Interactive)' steps each with at least one thumbnail_urls entry, OR\n"
+    "   - one final success step with at least three distinct URLs in thumbnail_urls.\n"
+    "   Typical set: (A) address bar / landing page proving the intended hostname or Target URL path, "
+    "(B) login form or sign-in step, (C) post-login authenticated view (dashboard, user menu, or success message).\n"
+    "10) Only after login_phase_status=success may you send pfm_node updates or review previous PFM results.\n"
+    "11) If blocked, explain exactly why and propose the next best sign-in strategy.\n"
 )
 
 _ACTIVITY_MESSAGE_PROMPT = (
@@ -81,22 +97,61 @@ _ACTIVITY_MESSAGE_PROMPT = (
 
 _LOGIN_PROGRESS_PROMPT = (
     "LOGIN STEP REPORTING:\n"
-    "- State your login plan briefly before/while trying.\n"
-    "- For each attempt, report what you saw, what you did, why, and next move.\n"
+    "- Slow down during sign-in. Do one meaningful action at a time, wait for the UI to settle, then report.\n"
+    "- Sign in only with an existing account. Never use sign-up/register/create-account/trial/onboarding flows.\n"
+    "- State your login plan briefly before/while trying, then keep the user informed while you wait.\n"
+    "- For each attempt, report what you saw, what you did, why, and next move in end-user friendly language.\n"
+    "- If username, password, OTP, captcha, environment, or account choice is missing, ask the user clearly and wait; do not guess.\n"
+    "- Use login_phase_status=pending while asking for user input or waiting for a login page/result.\n"
     "- Clearly report whether login succeeded and what evidence confirms success.\n"
     "- Capture screenshots frequently during meaningful UI transitions so end users can follow progress visually.\n"
+    "- Required login screenshot sequence: (1) target URL/site identity, (2) login form or credential step, "
+    "(3) authenticated post-login view.\n"
     "- When a screenshot is available, include it in report_running_step.thumbnail_urls.\n"
+    "- Before declaring success: attach at least 3 screenshots total (see LOGIN PHASE screenshot rule), "
+    "showing correct site + login + authenticated landing.\n"
+    + _ACTIVITY_MESSAGE_PROMPT
+)
+
+_INITIALIZATION_REVIEW_PROMPT = (
+    "INITIALIZATION STEP 2 (MANDATORY AFTER LOGIN, BEFORE DISCOVERY):\n"
+    "1) Do not start new exploration yet.\n"
+    "2) Read and analyze the inherited/template PFM context already provided in this session.\n"
+    "3) Summarize the previous accumulated PFM mindmap: key domains, important nodes, node-report coverage, and gaps.\n"
+    "4) Explain what you will verify or improve during the assigned run duration.\n"
+    "5) Call report_running_step with:\n"
+    "   - title: 'PFM inheritance review (Initialization)'\n"
+    "   - initialization_review_status: success\n"
+    "   - ready_to_explore: true\n"
+    "   - observation, finding, reasoning, decision, next_direction\n"
+    "6) In that report, show the previous result as a concise mindmap-style outline before the plan.\n"
+    "7) After this checkpoint is recorded, discovery may begin and the run timer starts.\n"
     + _ACTIVITY_MESSAGE_PROMPT
 )
 
 _PFM_STRUCTURE_PROMPT = (
     "PFM STRUCTURE RULES (for viewable mindmap):\n"
-    "- Return pfm_node in multi-level hierarchy (domain -> feature group -> atomic function -> action).\n"
-    "- Keep each hierarchy level under 20 sibling nodes.\n"
-    "- Provide brief title and brief description for each node.\n"
-    "- Keep title/description concise; avoid long paragraphs.\n"
+    "- A PFM node is used to represent a component or a functional area of a product or a system.\n"
+    "- A valid PFM node can be a view or page of a software product where one or a few specific functions exist.\n"
+    "- Specific Function: the node has a distinct, identifiable operation or functional purpose.\n"
+    "- Quantifiable Outcome: the node produces or supports observable outcomes and can often be further "
+    "represented by a few features and functions.\n"
+    "- Product Function Focus: explore product functions, not sample data. Sample data can feel like product "
+    "functions; identify and explain the difference before naming a node.\n"
+    "- Testable: the node can be verified by manual or automated test cases.\n"
+    "- Good PFM nodes: Account Access, User Management, Order Search, Report Export, Approval Workflow.\n"
+    "- Bad PFM nodes: Click Login, Type Password, Press Search, Open Dropdown, Scroll Page.\n"
+    "- Model the hierarchy as product/system domain -> component or functional area -> feature/function. "
+    "Do not create action-level nodes.\n"
+    "- Put clicks, typing, navigation, assertions, and expected results inside test_case_runs/test steps, not as pfm_node titles.\n"
+    "- Keep each hierarchy level under 20 sibling nodes and merge small actions into the nearest functional node.\n"
+    "- Provide brief functional-area title and concise description for each node.\n"
     "- Include parent_node_key and level when reporting child nodes.\n"
-    "- During exploration, capture screenshots frequently and attach available screenshots via report_running_step.thumbnail_urls.\n"
+    "- Screenshot evidence is mandatory for every PFM confirmation: whenever you identify, update, "
+    "or re-confirm a feature, functional area, or PFM node, capture a fresh screenshot and attach it "
+    "in the same report_running_step.thumbnail_urls call.\n"
+    "- This applies to inherited/existing nodes too. If prior learning says a feature exists, re-open "
+    "that UI state and send a current-run screenshot when you confirm it.\n"
     + _ACTIVITY_MESSAGE_PROMPT
 )
 
@@ -262,6 +317,7 @@ class ProjectExecutor:
         self._cooldown_s: Dict[str, float] = {}
         self._success_streak: Dict[str, int] = {}
         self._login_phase_prompt_sent: Dict[str, bool] = {}
+        self._initialization_review_prompt_sent: Dict[str, bool] = {}
         self._discovery_phase_prompt_sent: Dict[str, bool] = {}
         self._last_progress_seq_seen: Dict[str, int] = {}
         self._last_progress_activity_ts: Dict[str, float] = {}
@@ -285,6 +341,7 @@ class ProjectExecutor:
         self._cooldown_s[execution_id] = _COOLDOWN_BASE_S
         self._success_streak[execution_id] = 0
         self._login_phase_prompt_sent[execution_id] = False
+        self._initialization_review_prompt_sent[execution_id] = False
         self._discovery_phase_prompt_sent[execution_id] = False
         self._last_progress_seq_seen[execution_id] = int(execution.progress_log_seq or 0)
         self._last_progress_activity_ts[execution_id] = time.time()
@@ -306,6 +363,7 @@ class ProjectExecutor:
             self._cooldown_s.setdefault(execution_id, _COOLDOWN_BASE_S)
             self._success_streak.setdefault(execution_id, 0)
             self._login_phase_prompt_sent.setdefault(execution_id, False)
+            self._initialization_review_prompt_sent.setdefault(execution_id, False)
             self._discovery_phase_prompt_sent.setdefault(execution_id, False)
             task = asyncio.create_task(self._monitor_loop(execution_id))
             self._running[execution_id] = task
@@ -326,6 +384,8 @@ class ProjectExecutor:
                     ExecutionStatus.ERROR,
                 ):
                     await self._sync_pfm_artifacts(execution_id, force=True)
+                    if execution.status == ExecutionStatus.COMPLETED:
+                        await self._finalize_completed_execution(execution_id)
                     logger.info(
                         "[executor] Execution %s is terminal: %s",
                         execution_id,
@@ -352,7 +412,7 @@ class ProjectExecutor:
                             execution_id,
                             start_time=int(time.time() * 1000),
                             progress_percentage=0,
-                            executor_hint="Exploring...",
+                            executor_hint="Running...",
                         ) or execution
                     agent_active = self._pool.is_agent_active(session_key)
                     execution = self._store.update_execution(
@@ -382,8 +442,10 @@ class ProjectExecutor:
                                 stalled_for,
                             )
                             self._pool.interrupt_agent(session_key)
-                            if self._is_login_successful(latest):
+                            if self._is_initialization_review_complete(latest):
                                 self._discovery_phase_prompt_sent[execution_id] = False
+                            elif self._is_login_successful(latest):
+                                self._initialization_review_prompt_sent[execution_id] = False
                             else:
                                 self._login_phase_prompt_sent[execution_id] = False
                             self._last_progress_activity_ts[execution_id] = time.time()
@@ -435,6 +497,7 @@ class ProjectExecutor:
         self._cooldown_s.pop(execution_id, None)
         self._success_streak.pop(execution_id, None)
         self._login_phase_prompt_sent.pop(execution_id, None)
+        self._initialization_review_prompt_sent.pop(execution_id, None)
         self._discovery_phase_prompt_sent.pop(execution_id, None)
         self._last_progress_seq_seen.pop(execution_id, None)
         self._last_progress_activity_ts.pop(execution_id, None)
@@ -508,6 +571,9 @@ class ProjectExecutor:
 
     def _login_phase_status_from_log(self, progress_log: Optional[List[ProgressLogEntry]]) -> str:
         """Return login phase status: missing | pending | success | failed."""
+        if self._has_login_success_narrative_with_screenshots(progress_log or []):
+            return "success"
+
         seen_checkpoint = False
         for entry in reversed(progress_log or []):
             # Broader fallback: infer login success/failure from concrete tool results,
@@ -613,8 +679,106 @@ class ProjectExecutor:
             return "pending"
         return "pending" if seen_checkpoint else "missing"
 
+    def _has_login_success_narrative_with_screenshots(
+        self, progress_log: List[ProgressLogEntry]
+    ) -> bool:
+        """Infer login success when the agent forgot the structured checkpoint.
+
+        This still requires the user's evidence rule: at least 3 screenshots plus
+        explicit sign-in success language from this run's activity.
+        """
+        screenshot_urls = set()
+        success_seen = False
+        blocked_or_signup_seen = False
+        success_markers = (
+            "login successful",
+            "login was successful",
+            "logged in successfully",
+            "now logged in",
+            "sign in successful",
+            "signin successful",
+            "signed in successfully",
+            "authenticated view",
+            "post-login view",
+        )
+        blocked_markers = (
+            "login failed",
+            "sign in failed",
+            "authentication failed",
+            "invalid password",
+            "invalid username",
+            "started sign up",
+            "started signup",
+            "submitted sign up",
+            "submitted signup",
+            "created account",
+            "registered account",
+        )
+        for entry in progress_log:
+            for url in (entry.thumbnail_url, entry.image_url):
+                if url:
+                    screenshot_urls.add(str(url))
+            tool_input = entry.tool_input or {}
+            thumbs = tool_input.get("thumbnail_urls")
+            if isinstance(thumbs, list):
+                screenshot_urls.update(str(url) for url in thumbs if str(url).strip())
+
+            text = " ".join(
+                [
+                    str(entry.text or ""),
+                    str(tool_input.get("description") or ""),
+                    str(tool_input.get("observation") or ""),
+                    str(tool_input.get("finding") or ""),
+                    str(tool_input.get("reasoning") or ""),
+                    str(tool_input.get("decision") or ""),
+                    str(tool_input.get("next_direction") or ""),
+                ]
+            ).lower()
+            if any(marker in text for marker in blocked_markers):
+                blocked_or_signup_seen = True
+            if any(marker in text for marker in success_markers):
+                success_seen = True
+
+        return success_seen and not blocked_or_signup_seen and len(screenshot_urls) >= 3
+
     def _login_phase_status(self, execution: ProjectExecute) -> str:
         return self._login_phase_status_from_log(execution.progress_log or [])
+
+    def _initialization_review_status_from_log(
+        self, progress_log: Optional[List[ProgressLogEntry]]
+    ) -> str:
+        """Return initialization review status: missing | pending | success."""
+        for entry in reversed(progress_log or []):
+            if entry.kind != "tool_use" or (entry.tool_name or "") != "report_running_step":
+                continue
+            tool_input = entry.tool_input or {}
+            title = str(tool_input.get("title") or "").strip().lower()
+            text_blob = " ".join(
+                str(tool_input.get(k) or "")
+                for k in ("description", "observation", "finding", "reasoning", "decision", "next_direction")
+            ).strip().lower()
+            is_review = (
+                "pfm inheritance review (initialization)" in title
+                or "previous result" in title
+                or "previous results" in title
+                or "inherited pfm" in title
+                or "pfm inheritance" in title
+                or "pfm inheritance review" in text_blob
+                or "previous accumulated" in text_blob
+            )
+            if not is_review:
+                continue
+            status = str(tool_input.get("initialization_review_status") or "").strip().lower()
+            if status == "success" or tool_input.get("ready_to_explore") is True:
+                return "success"
+            return "pending"
+        return "missing"
+
+    def _initialization_review_status(self, execution: ProjectExecute) -> str:
+        return self._initialization_review_status_from_log(execution.progress_log or [])
+
+    def _is_initialization_review_complete(self, execution: ProjectExecute) -> bool:
+        return self._initialization_review_status(execution) == "success"
 
     def _has_login_checkpoint(self, execution: ProjectExecute) -> bool:
         return self._login_phase_status(execution) != "missing"
@@ -628,24 +792,85 @@ class ProjectExecutor:
             return ""
         lines = text.splitlines()
         phase_aliases = {
-            1: ("phase 1", "phase i", "environment & initialization", "browser setup"),
-            2: ("phase 2", "phase ii", "explore & discovery", "pfm node identification"),
-            3: ("phase 3", "phase iii", "ead story", "quantization"),
-            4: ("phase 4", "phase iv", "final deliverable", "report generation"),
+            1: (
+                "phase 1",
+                "phase i",
+                "environment & initialization",
+                "browser setup",
+                "login control",
+                "authentication rules",
+                "login execution",
+                "session recovery",
+            ),
+            2: (
+                "phase 2",
+                "phase ii",
+                "explore & discovery",
+                "pfm node identification",
+                "explore",
+                "pfm hierarchy",
+                "systematic navigation protocol",
+            ),
+            3: (
+                "phase 3",
+                "phase iii",
+                "ead story",
+                "quantization",
+                "generate report",
+                "report generation",
+                "final operator response format",
+            ),
+            4: (
+                "phase 4",
+                "phase iv",
+                "final deliverable",
+                "save data",
+            ),
         }
-        aliases = phase_aliases.get(phase_no, ())
+        target_phases = {phase_no}
+        aliases = tuple(alias for p in target_phases for alias in phase_aliases.get(p, ()))
+
+        def _heading_key(raw: str) -> str:
+            heading = raw.strip()
+            heading = re.sub(r"^#+\s*", "", heading).strip()
+            heading = re.sub(r"^\d+[\).\s-]+", "", heading).strip()
+            return heading.strip(":-").strip().lower()
+
+        def _matching_phase(raw: str) -> Optional[int]:
+            heading = _heading_key(raw)
+            if not heading:
+                return None
+            for p, p_aliases in phase_aliases.items():
+                for alias in p_aliases:
+                    if heading == alias or heading.startswith(f"{alias} ") or heading.startswith(f"{alias}:"):
+                        return p
+            return None
+
         collect = False
         collected: List[str] = []
         for raw in lines:
-            normalized = raw.strip().lower()
-            if any(alias in normalized for alias in aliases):
+            matched_phase = _matching_phase(raw)
+            normalized = _heading_key(raw)
+            if matched_phase in target_phases or any(alias == normalized for alias in aliases):
                 collect = True
                 continue
-            if collect and normalized.startswith("phase ") and "phase " in normalized:
+            if collect and matched_phase is not None and matched_phase not in target_phases:
                 break
             if collect:
                 collected.append(raw)
         return "\n".join(collected).strip()
+
+    def _extract_template_learning_context(self, ai_prompt: str) -> str:
+        text = str(ai_prompt or "").strip()
+        marker = "## Template Learning Context"
+        if marker not in text:
+            return ""
+        after_marker = text.split(marker, 1)[1].strip()
+        for next_marker in ("\n## Template Isolation Rules", "\n## "):
+            if next_marker in after_marker:
+                after_marker = after_marker.split(next_marker, 1)[0].strip()
+                break
+        return after_marker
 
     async def _auto_continue(self, execution_id: str) -> None:
         if execution_id in self._cancelled:
@@ -685,10 +910,27 @@ class ProjectExecutor:
         if not session_key:
             return
 
-        login_success = self._is_login_successful(execution)
+        login_status = self._login_phase_status(execution)
+        login_success = login_status == "success"
+        review_complete = self._is_initialization_review_complete(execution)
         should_send = (
-            (not login_success and not self._login_phase_prompt_sent.get(execution_id, False))
-            or (login_success and not self._discovery_phase_prompt_sent.get(execution_id, False))
+            (
+                not login_success
+                and (
+                    not self._login_phase_prompt_sent.get(execution_id, False)
+                    or login_status in ("missing", "pending")
+                )
+            )
+            or (
+                login_success
+                and not review_complete
+                and not self._initialization_review_prompt_sent.get(execution_id, False)
+            )
+            or (
+                login_success
+                and review_complete
+                and not self._discovery_phase_prompt_sent.get(execution_id, False)
+            )
         )
         if not should_send:
             return
@@ -716,11 +958,15 @@ class ProjectExecutor:
                 f"to avoid hitting API rate limits."
             )
 
+        project_boundary = self._project_boundary_prompt(execution)
+
         if not login_success:
             self._login_phase_prompt_sent[execution_id] = True
             phase1 = self._extract_phase_instruction(execution.ai_prompt or "", 1)
             target_hint = (execution.target_url or "").strip()
             user_message = (
+                project_boundary
+                + "\n\n"
                 "Login phase is required first. Execute login now and report real actions + reasoning."
                 + "\n"
                 + _LOGIN_PROGRESS_PROMPT
@@ -728,11 +974,37 @@ class ProjectExecutor:
                 + (f"\n\nPhase I assignment:\n{phase1}" if phase1 else "")
                 + pace_hint
             )
+        elif not review_complete:
+            self._initialization_review_prompt_sent[execution_id] = True
+            target_hint = (execution.target_url or "").strip()
+            inherited_context = self._extract_template_learning_context(execution.ai_prompt or "")
+            time_budget = (
+                f"{execution.time_budget_minutes} minutes"
+                if execution.time_budget_minutes
+                else "the assigned run duration"
+            )
+            user_message = (
+                project_boundary
+                + "\n\n"
+                + "Login is confirmed. Complete initialization step 2 before active discovery."
+                + "\n"
+                + _INITIALIZATION_REVIEW_PROMPT
+                + (f"\n\nTarget URL:\n{target_hint}" if target_hint else "")
+                + (
+                    f"\n\nTemplate Learning Context for post-login review:\n{inherited_context}"
+                    if inherited_context
+                    else "\n\nTemplate Learning Context for post-login review:\nNo previous PFM results were available for this template."
+                )
+                + f"\n\nAssigned active exploration duration after initialization: {time_budget}."
+                + pace_hint
+            )
         else:
             self._discovery_phase_prompt_sent[execution_id] = True
             phase2 = self._extract_phase_instruction(execution.ai_prompt or "", 2)
             target_hint = (execution.target_url or "").strip()
             user_message = (
+                project_boundary
+                + "\n\n"
                 "Login confirmed. Start PFM discovery phase now. "
                 "Report real actions/reasoning via report_running_step; include structured pfm_node; "
                 "periodically publish_pfm_artifacts."
@@ -746,7 +1018,28 @@ class ProjectExecutor:
         self._pool.send_message_async(
             session_key=session_key,
             user_message=user_message,
+            ephemeral_system_prompt=project_boundary,
             enable_tools=True,
+        )
+
+    def _project_boundary_prompt(self, execution: ProjectExecute) -> str:
+        target = (execution.target_url or "").strip() or "the configured target URL"
+        template_id = (execution.linked_template_id or "").strip()
+        run_name = (execution.name or execution.id).strip()
+        return "\n".join(
+            [
+                "HARD PROJECT TEMPLATE BOUNDARY:",
+                f"- Execution ID: {execution.id}.",
+                f"- Template ID: {template_id}.",
+                f"- Run name: {run_name}.",
+                f"- Target URL: {target}.",
+                "- This project template is independent from every other template.",
+                "- Do not use global memory, memories from other templates, previous chat sessions, or facts from any different target as evidence.",
+                "- If you remember SWAdmin, employee portal, team portal, user manager, system setting, or any other prior project, ignore it unless it is discovered again from this exact target during this run.",
+                "- Start from the Target URL above. Do not navigate to a remembered URL or subdomain unless the Target URL itself redirects there and you report that redirect as live evidence.",
+                "- PFM nodes, EAD node reports, screenshots, and training data must describe only this execution and this template.",
+                "- Every project tool call must use the Execution ID above.",
+            ]
         )
 
     async def _check_budget(self, execution_id: str) -> None:
@@ -900,7 +1193,7 @@ class ProjectExecutor:
                     ProgressLogEntry(
                         ts=msg_ts,
                         kind="assistant",
-                        text=content[:200],
+                        text=content[:1200],
                         image_url=image_url,
                         thumbnail_url=thumbnail_url,
                     )
@@ -919,7 +1212,7 @@ class ProjectExecutor:
             if not execution.start_time and self._login_phase_status_from_log(updated_log) == "success":
                 update_fields["start_time"] = int(time.time() * 1000)
                 update_fields["progress_percentage"] = 0
-                update_fields["executor_hint"] = "Login confirmed; PFM discovery is now active."
+                update_fields["executor_hint"] = "Running..."
             self._store.update_execution(execution_id, **update_fields)
 
     async def _sync_pfm_artifacts(self, execution_id: str, force: bool = False) -> None:
@@ -948,7 +1241,41 @@ class ProjectExecutor:
 
         reports = build_and_persist_pfm_artifacts(execution)
         self._store.update_execution(execution_id, reports=reports)
+        self._store.sync_execution_pfm_artifacts_from_state(execution_id)
         self._last_pfm_sync_seq[execution_id] = seq
+
+    async def _finalize_completed_execution(self, execution_id: str) -> None:
+        execution = self._store.get_execution(execution_id)
+        if not execution or execution.status != ExecutionStatus.COMPLETED:
+            return
+        try:
+            deliverables = generate_pfm_deliverables(self._store, execution_id)
+            refreshed = self._store.get_execution(execution_id) or execution
+            existing_by_filename = {
+                report.filename: report for report in (refreshed.reports or [])
+            }
+            for report in deliverables:
+                existing_by_filename[report.filename] = report
+            self._store.update_execution(
+                execution_id,
+                reports=list(existing_by_filename.values()),
+                executor_hint="AI Finish; PFM/FMR deliverables generated.",
+            )
+        except Exception as exc:
+            logger.warning(
+                "[executor] Failed to generate PFM/FMR deliverables for %s: %s",
+                execution_id,
+                exc,
+            )
+
+        try:
+            self._store.upsert_template_learning_summary(execution_id)
+        except Exception as exc:
+            logger.warning(
+                "[executor] Failed to update template learning summary for %s: %s",
+                execution_id,
+                exc,
+            )
 
     async def _report_progress_to_chat(self, execution_id: str, session_key: str) -> None:
         # User requested agent-native updates only; suppress executor-authored chat summaries.
@@ -1161,6 +1488,16 @@ class ProjectExecutor:
             operator_stop_kind=operator_stop_kind,
             cancel_reason=cancel_reason,
         )
+        if final_status == ExecutionStatus.COMPLETED:
+            try:
+                await self._sync_pfm_artifacts(execution_id, force=True)
+                await self._finalize_completed_execution(execution_id)
+            except Exception as exc:
+                logger.warning(
+                    "[executor] Failed to finalize completed execution %s: %s",
+                    execution_id,
+                    exc,
+                )
         logger.info(
             "[executor] Stopped execution %s status=%s kind=%s",
             execution_id,
