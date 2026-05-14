@@ -34,7 +34,7 @@ from reportlab.platypus import (
 )
 
 from .models import EadFmNodeRun, ProjectExecute, ProjectReportArtifact
-from .pfm_artifacts import derive_node_runs_from_progress, reports_root_dir
+from .pfm_artifacts import reports_root_dir, resolve_pfm_nodes_for_mindmap
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ def generate_pfm_deliverables(store, execution_id: str) -> List[ProjectReportArt
         return []
 
     template = store.get_template(execution.linked_template_id)
-    nodes = execution.results or derive_node_runs_from_progress(execution.progress_log or [])
+    nodes = resolve_pfm_nodes_for_mindmap(execution)
     artifacts = store.list_execution_pfm_artifacts(execution.id)
     node_reports = [
         artifact for artifact in artifacts if artifact.get("artifact_type") == "node_ead_report"

@@ -23,8 +23,8 @@ from .store import ProjectStore
 from .agent_pool import SessionAgentPool
 from .pfm_artifacts import (
     build_and_persist_pfm_artifacts,
-    derive_node_runs_from_progress,
     report_file_path,
+    resolve_pfm_nodes_for_mindmap,
 )
 from .pfm_deliverables import generate_pfm_deliverables
 
@@ -52,6 +52,17 @@ _RECOVERY_WINDOW_S = 600
 _POLL_INTERVAL_S = 1.2
 _PROGRESS_REPORT_INTERVAL_S = 15
 _STALL_INTERRUPT_S = 90.0
+# Optional timed regeneration of published PFM artifacts (accuracy still comes primarily
+# from progress-driven sync + terminal force-sync). 0/disabled by default — set e.g.
+# EAD_PFM_PERIODIC_SYNC_S=600 for 10-minute watchdog refreshes.
+_raw_periodic = (os.getenv("EAD_PFM_PERIODIC_SYNC_S", "0") or "").strip().lower()
+if _raw_periodic in ("", "0", "false", "off", "no"):
+    _PFM_PERIODIC_SYNC_S = 0.0
+else:
+    try:
+        _PFM_PERIODIC_SYNC_S = max(60.0, float(_raw_periodic))
+    except ValueError:
+        _PFM_PERIODIC_SYNC_S = 0.0
 
 _LOGIN_PHASE_PROMPT = (
     "LOGIN PHASE (MANDATORY, FIRST):\n"
@@ -116,16 +127,21 @@ _LOGIN_PROGRESS_PROMPT = (
 _INITIALIZATION_REVIEW_PROMPT = (
     "INITIALIZATION STEP 2 (MANDATORY AFTER LOGIN, BEFORE DISCOVERY):\n"
     "1) Do not start new exploration yet.\n"
-    "2) Read and analyze the inherited/template PFM context already provided in this session.\n"
-    "3) Summarize the previous accumulated PFM mindmap: key domains, important nodes, node-report coverage, and gaps.\n"
-    "4) Explain what you will verify or improve during the assigned run duration.\n"
-    "5) Call report_running_step with:\n"
+    "2) Call tool **read_ead_execution** once for this Execution ID and reconcile counters, artifact links, "
+    "and persisted `results[]` versus any system baseline tagged **[PFM-PHASE1-CANONICAL-BASELINE:v1]** in this transcript.\n"
+    "3) Read and summarize the inherited/template PFM context (including every **Persisted Node EAD report** "
+    "listed in that canonical baseline).\n"
+    "4) Summarize the accumulated PFM mindmap: domains, nodes, functional areas, gaps, "
+    "**and explicitly confirm coverage of each named EAD node report**.\n"
+    "5) Explain what you will verify or improve during this run's assigned duration.\n"
+    "6) Call report_running_step with:\n"
     "   - title: 'PFM inheritance review (Initialization)'\n"
     "   - initialization_review_status: success\n"
     "   - ready_to_explore: true\n"
     "   - observation, finding, reasoning, decision, next_direction\n"
-    "6) In that report, show the previous result as a concise mindmap-style outline before the plan.\n"
-    "7) After this checkpoint is recorded, discovery may begin and the run timer starts.\n"
+    "7) In that report, show the previous baseline as a concise mindmap-style outline before your plan "
+    "(include sub-areas inherited from hierarchy / parent nodes where known).\n"
+    "8) After this checkpoint is recorded, discovery may begin and the run timer progresses.\n"
     + _ACTIVITY_MESSAGE_PROMPT
 )
 
@@ -153,6 +169,39 @@ _PFM_STRUCTURE_PROMPT = (
     "- This applies to inherited/existing nodes too. If prior learning says a feature exists, re-open "
     "that UI state and send a current-run screenshot when you confirm it.\n"
     + _ACTIVITY_MESSAGE_PROMPT
+)
+
+_PFM_SNAPSHOT_COMMIT_PROMPT = (
+    "PFM SNAPSHOT COMMIT (single source of truth for the mindmap, persistence, and inheritance):\n"
+    "- Call the tool **commit_pfm_snapshot** roughly every 2 to 5 minutes during exploration and once "
+    "as the final step before this run ends. Each commit must reflect the **current full tree** "
+    "(roots + cross_cutting + hierarchy) even when you only revise a subset of EAD text.\n"
+    "- Required arguments: execution_id, version (monotonically increasing integer starting at 1, "
+    "and strictly greater than any previously committed version), roots[] (top-level PFM nodes), "
+    "optional cross_cutting[] (separate non-product buckets), and node_reports[] (Markdown EAD "
+    "reports keyed by node_key).\n"
+    "- Tree shape rules:\n"
+    "  * Each node carries node_key, title, parent_node_key (must match the position in the tree), "
+    "level, type, status, description, and optional children[].\n"
+    "  * For child nodes, node_key MUST be exactly parent_node_key + '/' + slug. Example: parent "
+    "node_key 'studio_editor' has child 'studio_editor/ead_script'.\n"
+    "  * node_key uses only letters, digits, '_', '-', '.', '/'.\n"
+    "  * Every node_key must be unique across the snapshot.\n"
+    "- node_reports[] workload (important):\n"
+    "  * On the **first** commit for this execution, include a non-empty Markdown EAD report for "
+    "**every** node_key in the tree.\n"
+    "  * On **later** commits, compare this tree to the last committed snapshot: include fresh "
+    "markdown only for **new, deleted-and-replaced, or materially updated** nodes. For unchanged "
+    "node_key values that already existed in the prior committed tree, **omit** them from "
+    "node_reports[] — the gateway automatically **carries forward** the previous saved report "
+    "from disk so you do not regenerate huge mindmaps every interval.\n"
+    "  * Always send full markdown for any **brand-new** node_key (no carry-forward exists yet).\n"
+    "  * Empty markdown in an included entry is rejected.\n"
+    "- The committed snapshot replaces the prior tree atomically; later commits overwrite earlier ones. "
+    "If validation fails the previous committed tree stays in place untouched.\n"
+    "- This commit is what end users see in the UI mindmap and what future runs inherit. Do not "
+    "describe the tree only in chat prose -- a chat answer that is not also committed via "
+    "commit_pfm_snapshot does NOT update the saved mindmap.\n"
 )
 
 _PROGRESS_MESSAGE_PREFIX = "📊 Progress Update"
@@ -321,6 +370,7 @@ class ProjectExecutor:
         self._discovery_phase_prompt_sent: Dict[str, bool] = {}
         self._last_progress_seq_seen: Dict[str, int] = {}
         self._last_progress_activity_ts: Dict[str, float] = {}
+        self._last_pfm_periodic_ts: Dict[str, float] = {}
 
     async def start_execution(self, execution_id: str) -> None:
         execution = self._store.get_execution(execution_id)
@@ -346,6 +396,8 @@ class ProjectExecutor:
         self._last_progress_seq_seen[execution_id] = int(execution.progress_log_seq or 0)
         self._last_progress_activity_ts[execution_id] = time.time()
 
+        self._last_pfm_periodic_ts[execution_id] = time.time()
+
         # Auto-continue will send the one-time phase prompt with tools enabled.
 
         task = asyncio.create_task(self._monitor_loop(execution_id))
@@ -365,6 +417,7 @@ class ProjectExecutor:
             self._login_phase_prompt_sent.setdefault(execution_id, False)
             self._initialization_review_prompt_sent.setdefault(execution_id, False)
             self._discovery_phase_prompt_sent.setdefault(execution_id, False)
+            self._last_pfm_periodic_ts.setdefault(execution_id, time.time())
             task = asyncio.create_task(self._monitor_loop(execution_id))
             self._running[execution_id] = task
             logger.info("[executor] Resumed monitoring execution %s", execution_id)
@@ -422,6 +475,17 @@ class ProjectExecutor:
 
                     await self._extract_progress(execution_id)
                     await self._sync_pfm_artifacts(execution_id)
+
+                    exec_now = self._store.get_execution(execution_id) or execution
+                    now_ts = time.time()
+                    last_pf = self._last_pfm_periodic_ts.get(execution_id, 0.0)
+                    if (
+                        _PFM_PERIODIC_SYNC_S >= 60.0
+                        and self._is_login_successful(exec_now)
+                        and (now_ts - last_pf >= _PFM_PERIODIC_SYNC_S)
+                    ):
+                        await self._sync_pfm_artifacts(execution_id, force=True)
+                        self._last_pfm_periodic_ts[execution_id] = now_ts
 
                     latest = self._store.get_execution(execution_id) or execution
                     current_seq = int(latest.progress_log_seq or 0)
@@ -501,6 +565,7 @@ class ProjectExecutor:
         self._discovery_phase_prompt_sent.pop(execution_id, None)
         self._last_progress_seq_seen.pop(execution_id, None)
         self._last_progress_activity_ts.pop(execution_id, None)
+        self._last_pfm_periodic_ts.pop(execution_id, None)
 
         if sk:
             _cleanup_browser_for_session(sk)
@@ -1007,9 +1072,11 @@ class ProjectExecutor:
                 + "\n\n"
                 "Login confirmed. Start PFM discovery phase now. "
                 "Report real actions/reasoning via report_running_step; include structured pfm_node; "
-                "periodically publish_pfm_artifacts."
+                "and call commit_pfm_snapshot roughly every 5 minutes to publish the full tree."
                 + "\n"
                 + _PFM_STRUCTURE_PROMPT
+                + "\n"
+                + _PFM_SNAPSHOT_COMMIT_PROMPT
                 + (f"\n\nTarget URL:\n{target_hint}" if target_hint else "")
                 + (f"\n\nPhase II assignment:\n{phase2}" if phase2 else "")
                 + pace_hint
@@ -1232,9 +1299,9 @@ class ProjectExecutor:
         # If the run did not produce structured node results yet, derive a live
         # placeholder map from transcript progress so the UI mindmap can update in real time.
         if login_success and not execution.results:
-            derived = derive_node_runs_from_progress(execution.progress_log or [])
-            if derived:
-                self._store.update_execution(execution_id, results=derived)
+            merged = resolve_pfm_nodes_for_mindmap(execution)
+            if merged:
+                self._store.update_execution(execution_id, results=merged)
                 refreshed = self._store.get_execution(execution_id)
                 if refreshed:
                     execution = refreshed
@@ -1248,6 +1315,28 @@ class ProjectExecutor:
         execution = self._store.get_execution(execution_id)
         if not execution or execution.status != ExecutionStatus.COMPLETED:
             return
+
+        try:
+            committed_tree = self._store.get_committed_pfm_tree(execution_id)
+            if not committed_tree:
+                logger.warning(
+                    "[executor] Execution %s completed without a committed PFM tree snapshot; "
+                    "mindmap will show 'Awaiting first commit'. Ensure the agent calls "
+                    "commit_pfm_snapshot during/before exploration ends.",
+                    execution_id,
+                )
+            else:
+                logger.info(
+                    "[executor] Finalize: execution %s has pfm_tree v%s with %s nodes.",
+                    execution_id,
+                    committed_tree.get("version"),
+                    len(committed_tree.get("flat_nodes") or []),
+                )
+        except Exception as exc:
+            logger.debug(
+                "[executor] get_committed_pfm_tree check failed for %s: %s", execution_id, exc
+            )
+
         try:
             deliverables = generate_pfm_deliverables(self._store, execution_id)
             refreshed = self._store.get_execution(execution_id) or execution

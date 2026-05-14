@@ -11,9 +11,16 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
-from .models import EadFmNodeRun, ProjectExecute, ProjectReportArtifact, ProgressLogEntry
+from .models import (
+    EadFmNodeRun,
+    ProjectExecute,
+    ProjectReportArtifact,
+    ProgressLogEntry,
+    TestCaseRun,
+    TestCaseStepRunStatus,
+)
 
 
 def reports_root_dir() -> Path:
@@ -64,20 +71,312 @@ def derive_node_runs_from_progress(progress_log: List[ProgressLogEntry], limit: 
     return runs
 
 
+def _pfm_node_dict_to_ead_run(
+    pfm_node: dict,
+    title_fallback: str = "",
+) -> Optional[EadFmNodeRun]:
+    """Build EadFmNodeRun from report_running_step pfm_node payload (same shape as projects/tools)."""
+    if not isinstance(pfm_node, dict):
+        return None
+    title = str(title_fallback or "").strip()
+    raw_node_key = str(
+        pfm_node.get("node_key")
+        or pfm_node.get("node_id")
+        or re.sub(r"[^a-z0-9]+", "-", str(pfm_node.get("title", "")).lower()).strip("-")
+        or ""
+    ).strip()
+    if not raw_node_key and not pfm_node.get("title"):
+        return None
+    parent_node_key = str(pfm_node.get("parent_node_key") or "").strip() or None
+    node_level_raw = pfm_node.get("level")
+    try:
+        node_level = max(0, int(node_level_raw)) if node_level_raw is not None else 0
+    except Exception:
+        node_level = 0
+    node_description = str(pfm_node.get("description") or "").strip()
+    node_key = raw_node_key or "node"
+    if parent_node_key and "/" not in node_key and ">" not in node_key:
+        node_key = f"{parent_node_key}/{node_key}"
+    node_id = str(pfm_node.get("node_id") or node_key)
+    node_title = str(pfm_node.get("title") or title or node_key)
+    node_type = str(pfm_node.get("type") or "feature-area")
+    node_status_raw = str(pfm_node.get("status") or "No Run").strip().lower()
+    node_status = (
+        TestCaseStepRunStatus.SUCCESS
+        if node_status_raw == "success"
+        else TestCaseStepRunStatus.FAILED
+        if node_status_raw == "failed"
+        else TestCaseStepRunStatus.NO_RUN
+    )
+
+    case_runs: List[TestCaseRun] = []
+    raw_cases = pfm_node.get("test_cases") or []
+    if isinstance(raw_cases, list):
+        for idx, raw in enumerate(raw_cases):
+            if not isinstance(raw, dict):
+                continue
+            raw_status = str(raw.get("status") or "No Run").strip().lower()
+            case_status = (
+                TestCaseStepRunStatus.SUCCESS
+                if raw_status == "success"
+                else TestCaseStepRunStatus.FAILED
+                if raw_status == "failed"
+                else TestCaseStepRunStatus.NO_RUN
+            )
+            case_title = str(raw.get("title") or f"Test case {idx + 1}")
+            case_id = str(
+                raw.get("case_id")
+                or re.sub(r"[^a-z0-9]+", "-", case_title.lower()).strip("-")
+                or f"case-{idx+1}"
+            )
+            case_runs.append(
+                TestCaseRun(
+                    case_id=case_id,
+                    title=case_title,
+                    status=case_status,
+                    test_case_step_runs=[],
+                )
+            )
+
+    return EadFmNodeRun(
+        node_id=node_id,
+        node_key=node_key,
+        parent_node_key=parent_node_key,
+        level=node_level,
+        type=node_type,
+        title=node_title,
+        meta=node_description,
+        status=node_status,
+        test_case_runs=case_runs,
+    )
+
+
+def derive_pfm_nodes_from_report_running_step_progress(
+    progress_log: List[ProgressLogEntry],
+) -> List[EadFmNodeRun]:
+    """
+    Recover PFM nodes declared in report_running_step tool calls from the progress log.
+    Later log entries win for the same node_key (last reported state).
+    """
+    ordered: List[EadFmNodeRun] = []
+    index_by_key: Dict[str, int] = {}
+    for entry in progress_log:
+        if entry.kind != "tool_use" or (entry.tool_name or "") != "report_running_step":
+            continue
+        ti = entry.tool_input
+        if not isinstance(ti, dict):
+            continue
+        pfm_node = ti.get("pfm_node")
+        if not isinstance(pfm_node, dict):
+            continue
+        title_fallback = str(ti.get("title") or "")
+        run = _pfm_node_dict_to_ead_run(pfm_node, title_fallback=title_fallback)
+        if not run or not run.node_key:
+            continue
+        k = run.node_key
+        if k in index_by_key:
+            ordered[index_by_key[k]] = run
+        else:
+            index_by_key[k] = len(ordered)
+            ordered.append(run)
+    return ordered
+
+
+_AGENT_AUTHORED_ENV = "EAD_PFM_AGENT_AUTHORED"
+
+
+def _agent_authored_enabled() -> bool:
+    """Strict agent-authored mode: only the committed PFM tree feeds the official mindmap."""
+    raw = (os.getenv(_AGENT_AUTHORED_ENV, "true") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _load_committed_tree_runs(execution: ProjectExecute) -> Optional[List[EadFmNodeRun]]:
+    """Read the canonical pfm_tree artifact and return its flattened EadFmNodeRun list.
+
+    Returns None when no tree has ever been committed for this execution. An empty
+    list indicates an explicit empty tree (treated upstream as "Awaiting first commit").
+    """
+    try:
+        from .pfm_tree import PFM_TREE_ARTIFACT_KEY, flat_nodes_to_ead_runs
+        from .store import ProjectStore
+    except Exception:
+        return None
+
+    try:
+        store = ProjectStore()
+    except Exception:
+        return None
+    artifact = store.get_execution_pfm_artifact(execution.id, PFM_TREE_ARTIFACT_KEY)
+    if not isinstance(artifact, dict):
+        return None
+    snap = artifact.get("snapshot")
+    if not isinstance(snap, dict):
+        return None
+    flat = snap.get("flat_nodes")
+    if not isinstance(flat, list):
+        return None
+    return flat_nodes_to_ead_runs(flat)
+
+
+def resolve_pfm_nodes_for_mindmap(execution: ProjectExecute) -> List[EadFmNodeRun]:
+    """
+    Nodes shown on the official PFM mindmap.
+
+    Strict (default) mode driven by EAD_PFM_AGENT_AUTHORED:
+        Read only the agent-authored, committed pfm_tree artifact. Progress-text
+        fallbacks are intentionally excluded so the diagram is a faithful
+        rendering of what the agent declared via `commit_pfm_snapshot`.
+
+    Legacy mode (EAD_PFM_AGENT_AUTHORED=false):
+        Merge `execution.results` with progress-log inferred nodes, as in the
+        previous implementation. Retained for backward compatibility on installs
+        that have not yet rolled out the new tool.
+    """
+    if _agent_authored_enabled():
+        committed = _load_committed_tree_runs(execution)
+        if committed is not None:
+            return committed
+        return list(execution.results or [])
+
+    stored = list(execution.results or [])
+    derived = derive_pfm_nodes_from_report_running_step_progress(execution.progress_log or [])
+
+    if not stored and not derived:
+        return derive_node_runs_from_progress(execution.progress_log or [])
+
+    if not stored:
+        return derived
+
+    stored_keys: Set[str] = {n.node_key for n in stored if getattr(n, "node_key", None)}
+    out = list(stored)
+    for node in derived:
+        if node.node_key and node.node_key not in stored_keys:
+            out.append(node)
+            stored_keys.add(node.node_key)
+    return out
+
+
+def _mindmap_status_text(node: EadFmNodeRun) -> str:
+    s = getattr(node.status, "value", None) if node.status is not None else None
+    if s is None:
+        s = str(node.status if node.status is not None else "No Run")
+    return str(s).replace("\n", " ").strip() or "No Run"
+
+
+def _mindmap_leaf_text(node: EadFmNodeRun) -> str:
+    raw = (node.title or node.node_key or node.node_id or "node").replace("\n", " ").strip()
+    if len(raw) > 92:
+        raw = raw[:89] + "..."
+    sts = _mindmap_status_text(node)
+    # Avoid parentheses in rendered line (nested shape syntax); use brackets for status.
+    raw = raw.replace("(", "[").replace(")", "]").replace('"', "'")
+    return f"{raw} [{sts}]"
+
+
+def _nodes_by_key(nodes: List[EadFmNodeRun]) -> Dict[str, EadFmNodeRun]:
+    out: Dict[str, EadFmNodeRun] = {}
+    for n in nodes:
+        k = (n.node_key or "").strip()
+        if k:
+            out[k] = n
+    return out
+
+
+def _nearest_path_parent_key(node_key: str, index: Dict[str, EadFmNodeRun]) -> Optional[str]:
+    if not node_key or "/" not in node_key.replace("\\", "/"):
+        return None
+    normalized = node_key.replace("\\", "/")
+    parts = normalized.split("/")
+    while len(parts) > 1:
+        parts.pop()
+        cand = "/".join(parts).strip()
+        if cand and cand in index:
+            return cand
+    return None
+
+
+def _resolved_parent_key(
+    node: EadFmNodeRun,
+    index: Dict[str, EadFmNodeRun],
+    own_key: str,
+) -> Optional[str]:
+    explicit = str(node.parent_node_key or "").strip()
+    if explicit and explicit != own_key and explicit in index:
+        return explicit
+    return _nearest_path_parent_key(own_key, index)
+
+
+def _partition_mindmap_tree(
+    nodes: List[EadFmNodeRun],
+    index: Dict[str, EadFmNodeRun],
+) -> tuple[List[EadFmNodeRun], Dict[str, List[EadFmNodeRun]]]:
+    roots: List[EadFmNodeRun] = []
+    children: Dict[str, List[EadFmNodeRun]] = {}
+    for node in nodes:
+        own_key = (node.node_key or "").strip()
+        if not own_key:
+            roots.append(node)
+            continue
+        parent_key = _resolved_parent_key(node, index, own_key)
+        if not parent_key:
+            roots.append(node)
+        else:
+            children.setdefault(parent_key, []).append(node)
+    return roots, children
+
+
 def _build_mermaid_mindmap(execution: ProjectExecute, nodes: List[EadFmNodeRun]) -> str:
     root_title = (execution.name or execution.id or "PFM Run").replace("\n", " ").strip()
+    if len(root_title) > 80:
+        root_title = root_title[:77] + "..."
+    root_title = root_title.replace("(", "[").replace(")", "]")
     lines = ["mindmap", f"  root(({root_title}))"]
 
     if not nodes:
         lines.append("    No PFM nodes recorded yet")
         return "\n".join(lines) + "\n"
 
-    for node in nodes:
-        label = (node.title or node.node_key or node.node_id).replace("\n", " ").strip()
-        if not label:
-            label = node.node_id
-        status = (node.status or "No Run").strip()
-        lines.append(f"    {label} ({status})")
+    keyed: Dict[str, EadFmNodeRun] = {}
+    orphans: List[EadFmNodeRun] = []
+    for n in nodes:
+        k = (n.node_key or "").strip()
+        if k:
+            keyed[k] = n
+        else:
+            orphans.append(n)
+    nodes = list(keyed.values()) + orphans
+
+    index = _nodes_by_key(nodes)
+    roots, children_map = _partition_mindmap_tree(nodes, index)
+    roots = sorted(
+        roots,
+        key=lambda n: (n.level or 0, (n.title or n.node_key or "").lower()),
+    )
+    for plist in children_map.values():
+        plist.sort(
+            key=lambda n: (n.level or 0, (n.title or n.node_key or "").lower()),
+        )
+
+    emitted: Set[str] = set()
+
+    def emit(node: EadFmNodeRun, depth: int) -> None:
+        if depth > 24:
+            return
+        own_key = (node.node_key or "").strip()
+        if own_key and own_key in emitted:
+            return
+        if own_key:
+            emitted.add(own_key)
+        indent_n = max(2 + 2 * depth, 4)
+        indent = " " * indent_n
+        lines.append(f"{indent}{_mindmap_leaf_text(node)}")
+        nk = own_key or f"_:id-{id(node)}"
+        for child in children_map.get(nk, []) or []:
+            emit(child, depth + 1)
+
+    for root in roots:
+        emit(root, depth=1)
 
     return "\n".join(lines) + "\n"
 
@@ -173,7 +472,7 @@ def _try_upload_to_s3(local_path: Path, execution_id: str, filename: str) -> Opt
 
 
 def build_pfm_artifact_payloads(execution: ProjectExecute) -> List[Dict]:
-    nodes = execution.results or derive_node_runs_from_progress(execution.progress_log or [])
+    nodes = resolve_pfm_nodes_for_mindmap(execution)
     created_at = int(time.time() * 1000)
     mindmap_name = "pfm-mindmap.mmd"
     report_name = "pfm-report.md"

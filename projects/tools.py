@@ -12,6 +12,10 @@ import re
 from typing import Optional
 
 from .pfm_artifacts import build_and_persist_pfm_artifacts
+from .pfm_tree import (
+    SnapshotValidationError,
+    validate_and_normalize_snapshot,
+)
 from .store import ProjectStore
 
 logger = logging.getLogger(__name__)
@@ -607,6 +611,172 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
         description="Generate and attach PFM mindmap/report artifacts for a run",
     )
 
+    def _commit_pfm_snapshot(args: dict, context: dict = None) -> str:
+        s = _get_store()
+        execution_id = str(args.get("execution_id") or "").strip()
+        if not execution_id:
+            return json.dumps({"error": "execution_id is required", "committed": False})
+        execution = s.get_execution(execution_id)
+        if not execution:
+            return json.dumps({"error": f"Execution {execution_id} not found", "committed": False})
+
+        previous_version = 0
+        prev_snap: Optional[dict] = None
+        try:
+            from .pfm_tree import (
+                PFM_TREE_ARTIFACT_KEY,
+                collect_node_report_markdown_by_key,
+                committed_tree_node_keys,
+            )
+
+            prev_art = s.get_execution_pfm_artifact(execution_id, PFM_TREE_ARTIFACT_KEY)
+            if isinstance(prev_art, dict):
+                prev_snap = prev_art.get("snapshot")
+                if isinstance(prev_snap, dict):
+                    previous_version = int(prev_snap.get("version") or 0)
+        except Exception:
+            previous_version = 0
+            prev_snap = None
+
+        carry_source_keys = committed_tree_node_keys(prev_snap if isinstance(prev_snap, dict) else None)
+        carry_library = (
+            collect_node_report_markdown_by_key(s, execution_id) if carry_source_keys else {}
+        )
+
+        try:
+            snapshot, _flat_runs, report_payloads = validate_and_normalize_snapshot(
+                args,
+                previous_version=previous_version,
+                report_carry_source_keys=carry_source_keys,
+                report_carry_library=carry_library,
+            )
+        except SnapshotValidationError as exc:
+            return json.dumps(
+                {
+                    "committed": False,
+                    "error": str(exc),
+                    "code": exc.code,
+                }
+            )
+
+        try:
+            result = s.replace_execution_pfm_tree(
+                execution_id,
+                snapshot=snapshot,
+                node_reports=report_payloads,
+            )
+        except Exception as exc:
+            logger.exception("[ead_tools] commit_pfm_snapshot failed for %s", execution_id)
+            return json.dumps(
+                {
+                    "committed": False,
+                    "error": f"persistence_failure: {exc}",
+                    "code": "persistence_failure",
+                }
+            )
+
+        incoming_reports = args.get("node_reports") or []
+        incoming_keys = {
+            str(r.get("node_key") or "").strip()
+            for r in incoming_reports
+            if isinstance(r, dict) and str(r.get("markdown") or r.get("content") or "").strip()
+        }
+        carried_report_count = sum(
+            1 for p in report_payloads if str(p.get("node_key") or "").strip() not in incoming_keys
+        )
+
+        return json.dumps(
+            {
+                "committed": True,
+                "execution_id": execution_id,
+                "pfm_tree_version": int(snapshot.get("version") or 0),
+                "generated_at": int(snapshot.get("generated_at") or 0),
+                "node_count": len(snapshot.get("flat_nodes") or []),
+                "report_count": len(report_payloads),
+                "incoming_report_count": len(incoming_keys),
+                "carried_forward_report_count": carried_report_count,
+                "previous_version": previous_version,
+                "reports_attached": list((result or {}).get("reports") or []) or None,
+            }
+        )
+
+    registry.register(
+        name="commit_pfm_snapshot",
+        toolset="project",
+        schema={
+            "type": "object",
+            "description": (
+                "Replace the canonical PFM tree for this execution with the entire "
+                "agent-authored hierarchy plus a Markdown EAD report for every node. "
+                "Call this roughly every 5 minutes during exploration and once at finalize. "
+                "The committed snapshot is the single source of truth for the mindmap, "
+                "persistence, and inheritance into future runs."
+            ),
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "The execution ID this snapshot belongs to",
+                },
+                "version": {
+                    "type": "integer",
+                    "description": (
+                        "Monotonic snapshot version. Must be strictly greater than the "
+                        "previously committed version for this execution. Start at 1."
+                    ),
+                },
+                "generated_at": {
+                    "type": "integer",
+                    "description": "Optional client-side timestamp in milliseconds since epoch",
+                },
+                "roots": {
+                    "type": "array",
+                    "description": (
+                        "Top-level PFM nodes (product/system domains) with recursive children. "
+                        "Each TreeNode has node_key, title, parent_node_key (must match the "
+                        "actual parent), level, type, status, description, and optional "
+                        "children[]. node_key must be unique across the snapshot and, for "
+                        "children, must start with the parent node_key plus '/'."
+                    ),
+                    "items": {"type": "object"},
+                },
+                "cross_cutting": {
+                    "type": "array",
+                    "description": (
+                        "Optional cross-cutting buckets (e.g. sample data, shared utilities) "
+                        "kept separate from the main product hierarchy. Same TreeNode shape."
+                    ),
+                    "items": {"type": "object"},
+                },
+                "node_reports": {
+                    "type": "array",
+                    "description": (
+                        "Markdown EAD reports keyed by node_key. On the **first** snapshot for this "
+                        "execution, include one entry with non-empty markdown for **every** node in "
+                        "the tree. On later snapshots (after at least one successful commit), you may "
+                        "send reports **only for new, renamed, or materially updated** nodes; the "
+                        "gateway automatically **carries forward** prior Markdown for unchanged "
+                        "node_key values from the last committed tree using saved node_ead_report "
+                        "artifacts. Always include full markdown for any brand-new node_key. "
+                        "Do not include node_key values that are not in roots/cross_cutting."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "node_key": {"type": "string"},
+                            "title": {"type": "string"},
+                            "markdown": {"type": "string"},
+                        },
+                        "required": ["node_key", "markdown"],
+                    },
+                },
+            },
+            "required": ["execution_id", "version", "roots", "node_reports"],
+        },
+        handler=_commit_pfm_snapshot,
+        description="Commit the entire agent-authored PFM tree plus per-node EAD reports",
+    )
+
     logger.info(
-        "[ead_tools] Registered read_ead_execution, report_running_step, publish_pfm_artifacts"
+        "[ead_tools] Registered read_ead_execution, report_running_step, "
+        "publish_pfm_artifacts, commit_pfm_snapshot"
     )

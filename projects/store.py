@@ -906,6 +906,157 @@ class ProjectStore:
         if execution.status == ExecutionStatus.COMPLETED:
             self.publish_execution_artifacts_to_template(execution.id)
 
+    # ------------------------------------------------------------------
+    # Agent-authored PFM tree (commit_pfm_snapshot pipeline)
+    # ------------------------------------------------------------------
+
+    def replace_execution_pfm_tree(
+        self,
+        execution_id: str,
+        *,
+        snapshot: Dict[str, Any],
+        node_reports: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Atomically replace the canonical agent-authored PFM tree for this execution.
+
+        - Writes pfm-tree.json (artifact_type "pfm_tree").
+        - Upserts node_ead_report artifacts (one per node_key) so the UI / Phase 1
+          baseline always read pre-saved Markdown.
+        - Replaces `executions.results` with the flattened tree so all legacy
+          consumers (reports, deliverables, exporters) see the same data.
+        - Rebuilds pfm-mindmap.mmd / pfm-report.md / per-execution side artifacts.
+        """
+        from .pfm_artifacts import build_and_persist_pfm_artifacts
+        from .pfm_tree import (
+            PFM_TREE_ARTIFACT_KEY,
+            PFM_TREE_ARTIFACT_TYPE,
+            flat_nodes_to_ead_runs,
+        )
+
+        execution = self.get_execution(execution_id)
+        if not execution:
+            return {"committed": False, "error": "execution_not_found"}
+
+        flat_nodes = list(snapshot.get("flat_nodes") or [])
+        flat_runs = flat_nodes_to_ead_runs(flat_nodes)
+        snapshot_payload = dict(snapshot)
+        version = int(snapshot_payload.get("version") or 0)
+        generated_at = int(snapshot_payload.get("generated_at") or int(time.time() * 1000))
+
+        artifact_payload = {
+            "artifact_key": PFM_TREE_ARTIFACT_KEY,
+            "artifact_type": PFM_TREE_ARTIFACT_TYPE,
+            "title": "PFM Tree Snapshot",
+            "filename": PFM_TREE_ARTIFACT_KEY,
+            "format": "json",
+            "snapshot": snapshot_payload,
+            "version": version,
+            "generated_at": generated_at,
+            "created_at": generated_at,
+            "node_count": len(flat_nodes),
+        }
+        self.upsert_execution_pfm_artifact(
+            execution.id,
+            PFM_TREE_ARTIFACT_KEY,
+            PFM_TREE_ARTIFACT_TYPE,
+            artifact_payload,
+        )
+
+        for report in node_reports or []:
+            if not isinstance(report, dict):
+                continue
+            node_key = str(report.get("node_key") or "").strip()
+            markdown = str(report.get("markdown") or report.get("content") or "").strip()
+            if not node_key or not markdown:
+                continue
+            self.save_node_ead_report_artifact(
+                execution.id,
+                node_key=node_key,
+                title=str(report.get("title") or node_key),
+                content=markdown,
+            )
+
+        updated = self.update_execution(execution.id, results=flat_runs)
+        execution = updated or execution
+
+        report_artifacts = []
+        try:
+            report_artifacts = build_and_persist_pfm_artifacts(execution)
+            self.update_execution(execution.id, reports=report_artifacts)
+        except Exception as exc:
+            logger.warning(
+                "[projects] build_and_persist_pfm_artifacts failed after commit_pfm_snapshot for %s: %s",
+                execution.id,
+                exc,
+            )
+
+        try:
+            self.sync_execution_pfm_artifacts_from_state(execution.id)
+        except Exception as exc:
+            logger.warning(
+                "[projects] sync_execution_pfm_artifacts_from_state failed after commit for %s: %s",
+                execution.id,
+                exc,
+            )
+
+        return {
+            "committed": True,
+            "execution_id": execution.id,
+            "pfm_tree_version": version,
+            "generated_at": generated_at,
+            "node_count": len(flat_nodes),
+            "report_count": len(node_reports or []),
+            "reports": [r.model_dump() if hasattr(r, "model_dump") else dict(r) for r in report_artifacts],
+        }
+
+    def get_committed_pfm_tree(self, execution_id: str) -> Optional[Dict[str, Any]]:
+        """Return the latest committed PFM tree snapshot, or None."""
+        from .pfm_tree import PFM_TREE_ARTIFACT_KEY
+
+        artifact = self.get_execution_pfm_artifact(execution_id, PFM_TREE_ARTIFACT_KEY)
+        if not isinstance(artifact, dict):
+            return None
+        snap = artifact.get("snapshot")
+        return snap if isinstance(snap, dict) else None
+
+    def get_pfm_view_state(self, execution_id: str) -> Optional[Dict[str, Any]]:
+        from .pfm_tree import PFM_VIEW_STATE_ARTIFACT_KEY
+
+        artifact = self.get_execution_pfm_artifact(execution_id, PFM_VIEW_STATE_ARTIFACT_KEY)
+        if not isinstance(artifact, dict):
+            return None
+        state = artifact.get("state")
+        return state if isinstance(state, dict) else None
+
+    def set_pfm_view_state(
+        self, execution_id: str, state: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        from .pfm_tree import (
+            PFM_VIEW_STATE_ARTIFACT_KEY,
+            PFM_VIEW_STATE_ARTIFACT_TYPE,
+        )
+
+        execution = self.get_execution(execution_id)
+        if not execution:
+            return None
+        payload = {
+            "artifact_key": PFM_VIEW_STATE_ARTIFACT_KEY,
+            "artifact_type": PFM_VIEW_STATE_ARTIFACT_TYPE,
+            "title": "PFM View State",
+            "filename": PFM_VIEW_STATE_ARTIFACT_KEY,
+            "format": "json",
+            "state": state,
+            "updated_at": int(time.time() * 1000),
+        }
+        self.upsert_execution_pfm_artifact(
+            execution.id,
+            PFM_VIEW_STATE_ARTIFACT_KEY,
+            PFM_VIEW_STATE_ARTIFACT_TYPE,
+            payload,
+        )
+        return payload
+
     def save_node_ead_report_artifact(
         self,
         execution_id: str,

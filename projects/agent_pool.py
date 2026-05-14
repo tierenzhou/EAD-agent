@@ -22,6 +22,39 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _coerce_message_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content)
+
+
+def _dedupe_prefetched_user_turn(
+    conversation_history: List[Dict[str, Any]], user_message: str
+) -> List[Dict[str, Any]]:
+    """If chat.send used deliver=False then deliver=True, the DB ends with a duplicate
+    user row before run_conversation appends the same turn again. Drop the trailing
+    user message when it exactly matches this user_message."""
+    if not conversation_history or not (user_message or "").strip():
+        return conversation_history
+    last = conversation_history[-1]
+    if last.get("role") != "user":
+        return conversation_history
+    prev = _coerce_message_text(last.get("content")).strip()
+    if prev == (user_message or "").strip():
+        return conversation_history[:-1]
+    return conversation_history
+
+
 class SessionAgentPool:
     """Manages agent execution per session key.
 
@@ -106,6 +139,7 @@ class SessionAgentPool:
         conversation_history = []
         if session_id:
             conversation_history = self._get_conversation_history(session_id)
+        conversation_history = _dedupe_prefetched_user_turn(conversation_history, user_message)
 
         tool_sets = ["project"] if enable_tools else []
         agent = self._create_agent(

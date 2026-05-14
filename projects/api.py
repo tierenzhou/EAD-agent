@@ -19,7 +19,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 _RUN_PURPOSE_ALLOWED = frozenset({"live_app_learning", "live_app_testing", "document_analysis"})
 _EVIDENCE_SOURCE_ALLOWED = frozenset({"live_app", "document", "hybrid"})
@@ -142,7 +142,7 @@ from projects.models import (
     ProjectTemplate,
 )
 from projects.store import ProjectStore
-from projects.pfm_artifacts import report_file_path
+from projects.pfm_artifacts import report_file_path, resolve_pfm_nodes_for_mindmap
 
 logger = logging.getLogger(__name__)
 _IMAGE_PATH_RE = re.compile(r"(?:MEDIA:)?(?P<path>/[^\s`\"']+\.(?:png|jpe?g|gif|webp))", re.IGNORECASE)
@@ -155,6 +155,107 @@ _MIN_BROWSER_SCREENSHOT_BYTES = 10_000
 
 # Align with EAD_ExpUI src/ui/pfm-mindmap-remote-cache.ts
 _PFM_MINDMAP_REMOTE_CACHE_MARKER = "[PFM-MINDMAP-CACHE:v1]"
+_PFM_PHASE1_BASELINE_MARKER = "[PFM-PHASE1-CANONICAL-BASELINE:v1]"
+
+
+def _build_phase1_canonical_baseline_message(
+    store: ProjectStore,
+    execution: ProjectExecute,
+) -> Optional[str]:
+    """
+    One authoritative Phase-1 baseline for agents: persisted PFM nodes, mindmap excerpt,
+    and per-node EAD reports so Initialization (post-login) can reconcile accurately.
+    """
+    nodes = resolve_pfm_nodes_for_mindmap(execution)
+    artifacts = store.list_execution_pfm_artifacts(execution.id)
+    committed_tree = store.get_committed_pfm_tree(execution.id)
+
+    mind_excerpt = ""
+    for art in artifacts:
+        if str(art.get("artifact_type") or "") == "pfm_mindmap":
+            mc = str(art.get("content") or "").strip()
+            if mc:
+                me = mc[:4500]
+                if len(mc) > 4500:
+                    me += "\n... [mindmap truncated] ..."
+                mind_excerpt = me
+                break
+
+    ereports_lines: List[str] = []
+    for art in artifacts:
+        if str(art.get("artifact_type") or "") != "node_ead_report":
+            continue
+        title = str(art.get("title") or art.get("artifact_key") or "EAD report").strip()
+        nk = str(art.get("node_key") or "").strip()
+        raw_ex = art.get("excerpt") if art.get("excerpt") is not None else art.get("content")
+        excerpt = str(raw_ex or "")[:900].strip().replace("\n", " ")
+        ereports_lines.append(f"- **{title}** (`node_key`: `{nk or 'n/a'}`): {excerpt}")
+
+    if not nodes and not mind_excerpt and not ereports_lines:
+        return None
+
+    chunks: List[str] = [
+        _PFM_PHASE1_BASELINE_MARKER,
+        "",
+        f"- **Execution ID:** `{execution.id}`",
+    ]
+    if isinstance(committed_tree, dict):
+        tree_version = int(committed_tree.get("version") or 0)
+        generated_at_ms = int(committed_tree.get("generated_at") or 0)
+        chunks.append(f"- **PFM tree version:** `v{tree_version}`")
+        if generated_at_ms:
+            chunks.append(f"- **PFM tree generated_at (ms):** `{generated_at_ms}`")
+    else:
+        chunks.append("- **PFM tree version:** `none` (no committed snapshot yet)")
+    if execution.inherited_from_execution_id:
+        chunks.append(
+            f"- **Inherited / seeded from execution:** `{execution.inherited_from_execution_id}`"
+        )
+    chunks.extend(
+        [
+            "",
+            "**Phase 1 (post-login Initialization) commitments:**",
+            "- This snapshot is authoritative **prior** product-structure state for this Execution ID ",
+            "(not live evidence yet). Confirm with targeted navigation and screenshots.",
+            "- Call **read_ead_execution** for this Execution ID and reconcile counters, artifact links, ",
+            "and `results[]` against this baseline and the listed Node EAD reports.",
+            "- In Initialization step 2, summarize this baseline as a concise mindmap-style outline ",
+            "(including coverage of **each** EAD note report listed here), cite gaps vs the live ",
+            "target URL, then set `initialization_review_status=success` and `ready_to_explore=true`.",
+            "",
+        ]
+    )
+    if nodes:
+        chunks.append(f"### Canonical PFM nodes ({len(nodes)})")
+        chunks.append("| # | Title | Node key | Status |")
+        chunks.append("|---|--------|----------|--------|")
+        for i, n in enumerate(nodes[:120], start=1):
+            t = str(n.title or "").replace("|", " ").strip()[:120]
+            k = str(n.node_key or "").replace("|", " ").strip()[:100]
+            st = getattr(n.status, "value", None) if n.status is not None else n.status
+            st_txt = str(st if st is not None else "").replace("|", " ")
+            chunks.append(f"| {i} | {t} | `{k}` | {st_txt} |")
+        if len(nodes) > 120:
+            chunks.append("")
+            chunks.append(f"... truncated: {len(nodes) - 120} more nodes omitted from snapshot.")
+        chunks.append("")
+    if ereports_lines:
+        chunks.append("### Persisted Node EAD reports (must appear in Initialization outline)")
+        chunks.extend(ereports_lines[:40])
+        if len(ereports_lines) > 40:
+            chunks.append(f"... +{len(ereports_lines) - 40} more reports not listed here.")
+        chunks.append("")
+    if mind_excerpt:
+        chunks.append("### Persisted Mermaid mindmap excerpt (structure reference)")
+        chunks.append("```")
+        chunks.append(mind_excerpt)
+        chunks.append("```")
+
+    body = "\n".join(chunks).strip()
+    max_len = 14_800
+    if len(body) > max_len:
+        body = body[: max_len - 40].rstrip() + "\n\n... [snapshot truncated]"
+    return body
 
 
 def _try_inject_inherited_pfm_mindmap_cache(
@@ -708,6 +809,18 @@ class ProjectHandlers:
             inherited_source_id,
         )
 
+        try:
+            self._store.sync_execution_pfm_artifacts_from_state(created.id)
+            refreshed_ex = self._store.get_execution(created.id)
+            if refreshed_ex:
+                created = refreshed_ex
+        except Exception as exc:
+            logger.warning(
+                "[projects] sync_execution_pfm_artifacts_from_state failed for %s: %s",
+                created.id,
+                exc,
+            )
+
         session_key = f"eadproj-exec-{created.id}"
         session_bootstrap_ok = False
         try:
@@ -727,6 +840,20 @@ class ProjectHandlers:
                 role="system",
                 content=boundary_message,
             )
+            phase1_snap = _build_phase1_canonical_baseline_message(self._store, created)
+            if phase1_snap:
+                db.append_message(
+                    session_id=session_id,
+                    role="system",
+                    content=phase1_snap,
+                )
+                logger.info(
+                    "[projects] Phase-1 canonical PFM baseline injected for execution %s", created.id
+                )
+            inh = getattr(created, "inherited_from_execution_id", None)
+            if inh and _try_inject_inherited_pfm_mindmap_cache(session_id, session_key, str(inh)):
+                logger.info("[projects] Injected UI mindmap cache from prior execution %s", inh)
+
             db.append_message(
                 session_id=session_id,
                 role="assistant",
@@ -882,6 +1009,43 @@ class ProjectHandlers:
         content_type, _ = mimetypes.guess_type(str(target))
         return web.FileResponse(path=target, headers={"Content-Type": content_type or "text/plain"})
 
+    async def handle_get_node_report_artifact(self, request: "web.Request") -> "web.Response":
+        from .pfm_tree import node_report_artifact_key
+
+        execution_id = request.match_info["execution_id"]
+        execution = self._store.get_execution(execution_id)
+        if not execution:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+        node_key = (request.query.get("node_key") or request.query.get("nodeKey") or "").strip()
+        if not node_key:
+            return _error_response("node_key is required")
+        artifact_key = node_report_artifact_key(node_key)
+        artifact = self._store.get_execution_pfm_artifact(execution_id, artifact_key)
+        snapshot = self._store.get_committed_pfm_tree(execution_id)
+        tree_version = int((snapshot or {}).get("version") or 0)
+        tree_generated_at = int((snapshot or {}).get("generated_at") or 0)
+        if not artifact:
+            return _json_response(
+                {
+                    "executionId": execution_id,
+                    "nodeKey": node_key,
+                    "artifact": None,
+                    "pfmTreeVersion": tree_version,
+                    "pfmTreeGeneratedAt": tree_generated_at,
+                }
+            )
+        return _json_response(
+            {
+                "executionId": execution_id,
+                "nodeKey": node_key,
+                "artifact": _to_camel_dict(artifact),
+                "pfmTreeVersion": tree_version,
+                "pfmTreeGeneratedAt": tree_generated_at,
+                "isStale": tree_generated_at > 0
+                    and int(artifact.get("created_at") or 0) < tree_generated_at,
+            }
+        )
+
     async def handle_save_node_report_artifact(self, request: "web.Request") -> "web.Response":
         execution_id = request.match_info["execution_id"]
         execution = self._store.get_execution(execution_id)
@@ -910,6 +1074,129 @@ class ProjectHandlers:
         if not artifact:
             return _error_response("Unable to save node report artifact")
         return _json_response(_to_camel_dict(artifact))
+
+    # ------------------------------------------------------------------
+    # Agent-authored PFM tree endpoints (commit_pfm_snapshot pipeline)
+    # ------------------------------------------------------------------
+
+    async def handle_get_pfm_tree(self, request: "web.Request") -> "web.Response":
+        execution_id = request.match_info["execution_id"]
+        execution = self._store.get_execution(execution_id)
+        if not execution:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+        snapshot = self._store.get_committed_pfm_tree(execution_id)
+        if snapshot is None:
+            return _json_response({"executionId": execution_id, "snapshot": None})
+        return _json_response(
+            {
+                "executionId": execution_id,
+                "snapshot": snapshot,
+                "version": int(snapshot.get("version") or 0),
+                "generatedAt": int(snapshot.get("generated_at") or 0),
+            }
+        )
+
+    async def handle_get_pfm_mindmap(self, request: "web.Request") -> "web.Response":
+        from .pfm_tree import render_mermaid_for_scope
+
+        execution_id = request.match_info["execution_id"]
+        execution = self._store.get_execution(execution_id)
+        if not execution:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+
+        snapshot = self._store.get_committed_pfm_tree(execution_id)
+        scope = request.query.get("scope", "top")
+        node_key = request.query.get("node_key") or request.query.get("nodeKey")
+        depth_raw = request.query.get("depth")
+        try:
+            depth = int(depth_raw) if depth_raw is not None else None
+        except Exception:
+            depth = None
+
+        if not snapshot:
+            mermaid = (
+                "mindmap\n"
+                f"  root(({(execution.name or execution.id).replace('(', '[').replace(')', ']')}))\n"
+                "    Awaiting first committed PFM tree\n"
+            )
+            return _json_response(
+                {
+                    "executionId": execution_id,
+                    "scope": scope,
+                    "nodeKey": node_key,
+                    "depth": depth,
+                    "version": 0,
+                    "generatedAt": 0,
+                    "mermaid": mermaid,
+                    "committed": False,
+                }
+            )
+
+        mermaid = render_mermaid_for_scope(
+            snapshot,
+            execution,
+            scope=scope,
+            node_key=node_key,
+            depth=depth,
+        )
+        return _json_response(
+            {
+                "executionId": execution_id,
+                "scope": scope,
+                "nodeKey": node_key,
+                "depth": depth,
+                "version": int(snapshot.get("version") or 0),
+                "generatedAt": int(snapshot.get("generated_at") or 0),
+                "mermaid": mermaid,
+                "committed": True,
+            }
+        )
+
+    async def handle_get_pfm_view(self, request: "web.Request") -> "web.Response":
+        from .pfm_tree import apply_view_state_to_tree
+
+        execution_id = request.match_info["execution_id"]
+        execution = self._store.get_execution(execution_id)
+        if not execution:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+        snapshot = self._store.get_committed_pfm_tree(execution_id)
+        saved = self._store.get_pfm_view_state(execution_id)
+        if snapshot:
+            repaired = apply_view_state_to_tree(saved, snapshot)
+        else:
+            repaired = {
+                "node_path": [],
+                "selected_node_key": None,
+                "view_scope": "top",
+                "depth_cap": 2,
+                "pfm_tree_version": 0,
+                "updated_at": int(time.time() * 1000),
+            }
+        return _json_response(
+            {
+                "executionId": execution_id,
+                "state": _to_camel_dict(repaired),
+            }
+        )
+
+    async def handle_put_pfm_view(self, request: "web.Request") -> "web.Response":
+        from .pfm_tree import apply_view_state_to_tree
+
+        execution_id = request.match_info["execution_id"]
+        execution = self._store.get_execution(execution_id)
+        if not execution:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+        try:
+            body = _to_snake_dict(await request.json())
+        except Exception:
+            return _error_response("Invalid JSON")
+
+        snapshot = self._store.get_committed_pfm_tree(execution_id) or {"flat_nodes": []}
+        repaired = apply_view_state_to_tree(body, snapshot)
+        self._store.set_pfm_view_state(execution_id, repaired)
+        return _json_response(
+            {"executionId": execution_id, "state": _to_camel_dict(repaired)}
+        )
 
     async def handle_pause_execution(self, request: "web.Request") -> "web.Response":
         execution_id = request.match_info["execution_id"]
@@ -977,4 +1264,24 @@ class ProjectHandlers:
         app.router.add_post(
             "/v1/projects/executions/{execution_id}/artifacts/node-report",
             self.handle_save_node_report_artifact,
+        )
+        app.router.add_get(
+            "/v1/projects/executions/{execution_id}/artifacts/node-report",
+            self.handle_get_node_report_artifact,
+        )
+        app.router.add_get(
+            "/v1/projects/executions/{execution_id}/pfm/tree",
+            self.handle_get_pfm_tree,
+        )
+        app.router.add_get(
+            "/v1/projects/executions/{execution_id}/pfm/mindmap",
+            self.handle_get_pfm_mindmap,
+        )
+        app.router.add_get(
+            "/v1/projects/executions/{execution_id}/pfm/view",
+            self.handle_get_pfm_view,
+        )
+        app.router.add_put(
+            "/v1/projects/executions/{execution_id}/pfm/view",
+            self.handle_put_pfm_view,
         )
