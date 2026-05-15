@@ -407,18 +407,20 @@ def test_openrouter_key_takes_priority_over_openai_key(monkeypatch):
     assert resolved["api_key"] == "sk-or-should-win"
 
 
-def test_openai_key_used_when_no_openrouter_key(monkeypatch):
-    """OPENAI_API_KEY is used as fallback when OPENROUTER_API_KEY is not set."""
+def test_openai_key_not_used_for_openrouter_host(monkeypatch):
+    """OPENAI_API_KEY must not be sent to openrouter.ai (invalid → HTTP 401)."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
     monkeypatch.setattr(rp, "_get_model_config", lambda: {})
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-fallback")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
 
     resolved = rp.resolve_runtime_provider(requested="openrouter")
 
-    assert resolved["api_key"] == "sk-openai-fallback"
+    assert resolved["api_key"] == ""
+    assert "openrouter.ai" in resolved["base_url"]
 
 
 def test_custom_endpoint_prefers_openai_key(monkeypatch):

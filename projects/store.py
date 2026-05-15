@@ -388,6 +388,15 @@ class ProjectStore:
             valid_for_data_reporting_training=False,
             invalid_for_data_reporting_training_reason=reason_text,
         )
+        tmpl = self.get_template(execution.linked_template_id)
+        if tmpl and (tmpl.canonical_pfm_execution_id or "").strip() == execution_id:
+            self.update_template(
+                execution.linked_template_id,
+                canonical_pfm_execution_id=None,
+                canonical_pfm_promoted_at=None,
+                canonical_pfm_promoted_by=None,
+                canonical_pfm_promotion_rationale=None,
+            )
         self.remove_execution_learning_contribution(execution_id, execution.linked_template_id)
         self.rebuild_template_learning_from_latest_good_run(execution.linked_template_id)
         return updated
@@ -1019,6 +1028,71 @@ class ProjectStore:
             return None
         snap = artifact.get("snapshot")
         return snap if isinstance(snap, dict) else None
+
+    def has_committed_pfm_tree(self, execution_id: str) -> bool:
+        snap = self.get_committed_pfm_tree(execution_id)
+        if not isinstance(snap, dict):
+            return False
+        ver = int(snap.get("version") or 0)
+        flat = snap.get("flat_nodes") or snap.get("flatNodes") or []
+        return ver > 0 and isinstance(flat, list) and len(flat) > 0
+
+    def resolve_pfm_baseline_execution_id(self, ex: ProjectExecute) -> Optional[str]:
+        """Execution id to read committed PFM from when ``ex`` has no snapshot yet."""
+        if self.has_committed_pfm_tree(ex.id):
+            return None
+        tmpl = self.get_template(ex.linked_template_id)
+        canon = (tmpl.canonical_pfm_execution_id or "").strip() if tmpl else ""
+        if canon and canon != ex.id and self.has_committed_pfm_tree(canon):
+            return canon
+        inh = (ex.inherited_from_execution_id or "").strip()
+        if inh and inh != ex.id and self.has_committed_pfm_tree(inh):
+            return inh
+        return None
+
+    def promote_template_canonical_pfm(
+        self,
+        template_id: str,
+        execution_id: str,
+        *,
+        source: str,
+        rationale: Optional[str] = None,
+        require_eligible: bool = True,
+    ) -> Optional[ProjectTemplate]:
+        """
+        Set the template's canonical PFM pointer to ``execution_id``.
+
+        ``require_eligible``: when True (AI path), refuse if the run is marked
+        invalid for reporting/training or opted out of learning.
+        """
+        template = self.get_template(template_id)
+        if not template:
+            return None
+        execution = self.get_execution(execution_id)
+        if not execution or execution.linked_template_id != template_id:
+            return None
+        if not self.has_committed_pfm_tree(execution_id):
+            return None
+        if require_eligible:
+            if execution.valid_for_data_reporting_training is False:
+                return None
+            if execution.contributes_to_learning is False:
+                return None
+        now_ms = int(time.time() * 1000)
+        rationale_text = (rationale or "").strip()[:8000] or None
+        updated = self.update_template(
+            template_id,
+            canonical_pfm_execution_id=execution_id,
+            canonical_pfm_promoted_at=now_ms,
+            canonical_pfm_promoted_by=(source or "operator")[:32],
+            canonical_pfm_promotion_rationale=rationale_text,
+        )
+        if updated:
+            self.update_execution(
+                execution_id,
+                pfm_canonical_promotion_applied=True,
+            )
+        return updated
 
     def get_pfm_view_state(self, execution_id: str) -> Optional[Dict[str, Any]]:
         from .pfm_tree import PFM_VIEW_STATE_ARTIFACT_KEY

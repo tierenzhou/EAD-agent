@@ -645,11 +645,13 @@ class ProjectHandlers:
             template_id=template_id or None,
             status=status or None,
         )
-        return _json_response(
-            {
-                "executions": [_to_camel_dict(json.loads(e.model_dump_json())) for e in executions],
-            }
-        )
+        payloads = []
+        for e in executions:
+            raw = json.loads(e.model_dump_json())
+            raw["pfm_has_committed_snapshot"] = self._store.has_committed_pfm_tree(e.id)
+            raw["pfm_baseline_execution_id"] = self._store.resolve_pfm_baseline_execution_id(e)
+            payloads.append(_to_camel_dict(raw))
+        return _json_response({"executions": payloads})
 
     async def handle_get_execution(self, request: "web.Request") -> "web.Response":
         execution_id = request.match_info["execution_id"]
@@ -672,7 +674,64 @@ class ProjectHandlers:
                 )
             except Exception as exc:
                 logger.warning("[projects] Failed to persist recovered screenshots for %s: %s", execution_id, exc)
+        ex_latest = self._store.get_execution(execution_id) or execution
+        raw["pfm_has_committed_snapshot"] = self._store.has_committed_pfm_tree(execution_id)
+        raw["pfm_baseline_execution_id"] = self._store.resolve_pfm_baseline_execution_id(ex_latest)
         return _json_response(_to_camel_dict(raw))
+
+    async def handle_post_template_pfm_canonical(self, request: "web.Request") -> "web.Response":
+        """Operator (or integration) sets the template canonical PFM execution."""
+        template_id = request.match_info["template_id"]
+        try:
+            body = _to_snake_dict(await request.json())
+        except Exception:
+            return _error_response("Invalid JSON")
+        execution_id = str(body.get("execution_id") or body.get("executionId") or "").strip()
+        if not execution_id:
+            return _error_response("execution_id is required")
+        source = str(body.get("source") or "operator").strip()[:32] or "operator"
+        rationale = body.get("rationale") or body.get("rationale_text") or ""
+        tmpl = self._store.promote_template_canonical_pfm(
+            template_id,
+            execution_id,
+            source=source,
+            rationale=str(rationale) if rationale is not None else None,
+            require_eligible=False,
+        )
+        if not tmpl:
+            return _error_response(
+                "Could not promote canonical PFM (template or execution not found, "
+                "execution not linked to template, or no committed PFM tree).",
+                400,
+                "promotion_refused",
+            )
+        now_ms = int(time.time() * 1000)
+        self._store.update_execution(
+            execution_id,
+            pfm_canonical_evaluation_status="promoted",
+            pfm_canonical_replace_recommended=True,
+            pfm_canonical_evaluation_confidence=1.0,
+            pfm_canonical_evaluation_rationale=str(rationale or "operator_promotion")[:4000] or None,
+            pfm_canonical_evaluation_at_ms=now_ms,
+            pfm_canonical_promotion_applied=True,
+        )
+        return _template_json(tmpl)
+
+    async def handle_post_execution_evaluate_canonical(self, request: "web.Request") -> "web.Response":
+        """Re-run AI canonical evaluation (and optional promotion) for a completed execution."""
+        execution_id = request.match_info["execution_id"]
+        try:
+            body = _to_snake_dict(await request.json())
+        except Exception:
+            body = {}
+        force = _coerce_request_bool(body.get("force")) is True
+        from projects.pfm_canonical_judge import evaluate_and_maybe_promote_after_completion
+
+        result = await evaluate_and_maybe_promote_after_completion(
+            self._store, execution_id, force=force
+        )
+        status = 200 if result.get("ok") else 400
+        return _json_response(_to_camel_dict(result), status=status)
 
     async def handle_run_execution(self, request: "web.Request") -> "web.Response":
         try:
@@ -1011,14 +1070,70 @@ class ProjectHandlers:
         )
 
     async def handle_post_pfm_request_snapshot(self, request: "web.Request") -> "web.Response":
-        """Ask the run's agent to commit an updated PFM tree (commit_pfm_snapshot)."""
+        """Queue agent commit_pfm_snapshot (active runs) or materialize from run data (inactive)."""
         execution_id = request.match_info["execution_id"]
         execution = self._store.get_execution(execution_id)
         if not execution:
             return _error_response(f"Execution {execution_id} not found", 404, "not_found")
-        if not self._executor:
-            return _error_response("Project executor is not available", 503, "unavailable")
-        result = self._executor.request_pfm_snapshot_refresh(execution_id)
+
+        body: Dict[str, Any] = {}
+        try:
+            if request.body_exists:
+                raw = await request.json()
+                if isinstance(raw, dict):
+                    body = _to_snake_dict(raw)
+        except json.JSONDecodeError:
+            body = {}
+        except Exception:
+            return _error_response("Invalid JSON", 400, "invalid_json")
+
+        explicit_materialize = _coerce_request_bool(body.get("materialize"))
+        promote_tc = _coerce_request_bool(body.get("promote_template_canonical"))
+        if promote_tc is None:
+            promote_tc = True
+
+        is_active = execution.status in (ExecutionStatus.RUNNING, ExecutionStatus.PENDING)
+
+        if explicit_materialize is True:
+            from .pfm_materialize import materialize_operator_pfm_snapshot
+
+            result = materialize_operator_pfm_snapshot(
+                self._store,
+                execution_id,
+                promote_template_canonical=promote_tc,
+            )
+        elif explicit_materialize is False:
+            if not self._executor:
+                return _error_response("Project executor is not available", 503, "unavailable")
+            result = self._executor.request_pfm_snapshot_refresh(execution_id)
+        else:
+            # Default: prefer agent commit_pfm_snapshot (full-tree source of truth)
+            # whenever an executor/session is available; fallback to materialize.
+            if self._executor:
+                nudged = self._executor.request_pfm_snapshot_refresh(execution_id)
+                if nudged.get("ok"):
+                    result = nudged
+                elif nudged.get("code") in ("execution_not_active", "no_session", "not_found"):
+                    from .pfm_materialize import materialize_operator_pfm_snapshot
+
+                    result = materialize_operator_pfm_snapshot(
+                        self._store,
+                        execution_id,
+                        promote_template_canonical=promote_tc,
+                    )
+                else:
+                    result = nudged
+            else:
+                if is_active:
+                    return _error_response("Project executor is not available", 503, "unavailable")
+                from .pfm_materialize import materialize_operator_pfm_snapshot
+
+                result = materialize_operator_pfm_snapshot(
+                    self._store,
+                    execution_id,
+                    promote_template_canonical=promote_tc,
+                )
+
         raw = dict(result)
         raw["execution_id"] = execution_id
         return _json_response(_to_camel_dict(raw))
@@ -1094,7 +1209,7 @@ class ProjectHandlers:
             repaired = {
                 "node_path": [],
                 "selected_node_key": None,
-                "view_scope": "top",
+                "view_scope": "focus",
                 "depth_cap": 2,
                 "pfm_tree_version": 0,
                 "updated_at": int(time.time() * 1000),
@@ -1166,6 +1281,10 @@ class ProjectHandlers:
         app.router.add_post(
             "/v1/projects/templates/{template_id}/activate", self.handle_activate_template
         )
+        app.router.add_post(
+            "/v1/projects/templates/{template_id}/pfm/canonical",
+            self.handle_post_template_pfm_canonical,
+        )
 
         app.router.add_get("/v1/projects/executions", self.handle_list_executions)
         app.router.add_get("/v1/projects/executions/{execution_id}", self.handle_get_execution)
@@ -1215,4 +1334,8 @@ class ProjectHandlers:
         app.router.add_put(
             "/v1/projects/executions/{execution_id}/pfm/view",
             self.handle_put_pfm_view,
+        )
+        app.router.add_post(
+            "/v1/projects/executions/{execution_id}/pfm/evaluate-canonical",
+            self.handle_post_execution_evaluate_canonical,
         )

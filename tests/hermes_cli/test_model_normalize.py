@@ -117,6 +117,31 @@ class TestIssue6211NativeProviderPrefixNormalization:
         assert normalize_model_for_provider(model, target_provider) == expected
 
 
+# ── DeepSeek native API (v4 model ids) ─────────────────────────────────
+
+class TestDeepSeekNativeModelNormalization:
+    """Native api.deepseek.com accepts deepseek-v4-flash / deepseek-v4-pro."""
+
+    def test_empty_defaults_to_v4_flash(self):
+        assert normalize_model_for_provider("", "deepseek") == "deepseek-v4-flash"
+
+    def test_legacy_chat_maps_to_v4_flash(self):
+        assert normalize_model_for_provider("deepseek-chat", "deepseek") == "deepseek-v4-flash"
+
+    def test_legacy_reasoner_maps_to_v4_pro(self):
+        assert normalize_model_for_provider("deepseek-reasoner", "deepseek") == "deepseek-v4-pro"
+
+    def test_v4_ids_pass_through(self):
+        assert normalize_model_for_provider("deepseek-v4-flash", "deepseek") == "deepseek-v4-flash"
+        assert normalize_model_for_provider("deepseek-v4-pro", "deepseek") == "deepseek-v4-pro"
+
+    def test_reasoner_keyword_maps_to_v4_pro(self):
+        assert normalize_model_for_provider("deepseek-r1", "deepseek") == "deepseek-v4-pro"
+
+    def test_openrouter_slug_stripped_for_native(self):
+        assert normalize_model_for_provider("deepseek/deepseek-chat", "deepseek") == "deepseek-v4-flash"
+
+
 # ── detect_vendor ──────────────────────────────────────────────────────
 
 class TestDetectVendor:

@@ -243,19 +243,19 @@ def test_mermaid_top_scope_emits_top_level_nodes_only():
     snapshot, _, _ = validate_and_normalize_snapshot(_good_payload(1))
     mermaid = render_mermaid_for_scope(snapshot, _execution_for_render(), scope="top")
     assert mermaid.startswith("mindmap")
-    assert "Auth [Success]" in mermaid
-    assert "Studio [Success]" in mermaid
-    assert "Shared [No Run]" in mermaid
+    assert "Auth" in mermaid
+    assert "Studio" in mermaid
+    assert "Shared" in mermaid
     # top scope must not descend past depth 1
-    assert "Login [Success]" not in mermaid
-    assert "Signup [No Run]" not in mermaid
+    assert "Login" not in mermaid
+    assert "Signup" not in mermaid
 
 
 def test_mermaid_full_scope_emits_entire_tree():
     snapshot, _, _ = validate_and_normalize_snapshot(_good_payload(1))
     mermaid = render_mermaid_for_scope(snapshot, _execution_for_render(), scope="full")
     for label in ("Auth", "Login", "Signup", "Studio", "Shared"):
-        assert f"{label} [" in mermaid
+        assert label in mermaid
 
 
 def test_mermaid_subtree_scope_anchors_on_node_key():
@@ -267,9 +267,9 @@ def test_mermaid_subtree_scope_anchors_on_node_key():
         node_key="auth",
         depth=2,
     )
-    assert "Auth [Success]" in mermaid
-    assert "Login [Success]" in mermaid
-    assert "Signup [No Run]" in mermaid
+    assert "Auth" in mermaid
+    assert "Login" in mermaid
+    assert "Signup" in mermaid
     assert "Studio" not in mermaid
     assert "Shared" not in mermaid
 
@@ -279,8 +279,8 @@ def test_mermaid_path_scope_includes_only_path_to_node():
     mermaid = render_mermaid_for_scope(
         snapshot, _execution_for_render(), scope="path", node_key="auth/login"
     )
-    assert "Auth [Success]" in mermaid
-    assert "Login [Success]" in mermaid
+    assert "Auth" in mermaid
+    assert "Login" in mermaid
     assert "Signup" not in mermaid
     assert "Studio" not in mermaid
 
@@ -295,6 +295,34 @@ def test_mermaid_subtree_for_unknown_node_returns_diagnostic():
         depth=2,
     )
     assert "Unknown node_key" in mermaid
+
+
+def test_mermaid_focus_scope_defaults_to_top_level_when_no_node_key():
+    snapshot, _, _ = validate_and_normalize_snapshot(_good_payload(1))
+    mermaid = render_mermaid_for_scope(snapshot, _execution_for_render(), scope="focus")
+    assert "root((Demo Run))" in mermaid
+    assert "Auth" in mermaid
+    assert "Studio" in mermaid
+    assert "Login" not in mermaid
+    assert "Signup" not in mermaid
+
+
+def test_mermaid_focus_scope_emits_selected_plus_one_child_level():
+    snapshot, _, _ = validate_and_normalize_snapshot(_good_payload(1))
+    mermaid = render_mermaid_for_scope(
+        snapshot,
+        _execution_for_render(),
+        scope="focus",
+        node_key="auth",
+    )
+    # Selected node becomes center root in focus mode.
+    assert "root((Auth))" in mermaid
+    assert "Login" in mermaid
+    assert "Signup" in mermaid
+    assert "\n    Auth\n" not in mermaid
+    assert "Demo Run" not in mermaid
+    assert "Studio" not in mermaid
+    assert "Shared" not in mermaid
 
 
 def test_mermaid_same_snapshot_deterministic():
@@ -365,7 +393,7 @@ def test_view_state_falls_back_to_top_when_nothing_survives():
     repaired = apply_view_state_to_tree(saved, snapshot)
     assert repaired["selected_node_key"] is None
     assert repaired["node_path"] == []
-    assert repaired["view_scope"] == "top"
+    assert repaired["view_scope"] == "focus"
 
 
 # ---------------------------------------------------------------------------

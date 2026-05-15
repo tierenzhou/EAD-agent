@@ -176,7 +176,10 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": (
+        "Authorization, Content-Type, Idempotency-Key, "
+        "X-Explore-Admin-Session, X-Hermes-Session-Id"
+    ),
 }
 
 
@@ -1930,6 +1933,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     logger.info("[api_server] ProjectExecutor wired (store + agent_pool)")
             except Exception as e:
                 logger.warning("[api_server] Chat control API not available: %s", e)
+            try:
+                from gateway.control_plane.admin_routes import setup_explore_control_plane
+
+                setup_explore_control_plane(self._app)
+            except Exception as e:
+                logger.warning("[api_server] Explore admin control plane not available: %s", e)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

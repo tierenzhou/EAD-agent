@@ -30,6 +30,52 @@ from hermes_cli.config import load_config
 from hermes_constants import OPENROUTER_BASE_URL
 
 
+def sanitize_openrouter_empty_credentials(
+    runtime: Dict[str, Any],
+    *,
+    explicit_base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """If resolution would call ``openrouter.ai`` with no Bearer token but
+    ``DEEPSEEK_API_KEY`` is set, rewrite to the native DeepSeek endpoint.
+
+    This is a last-chance guard for gateway/project agents when an older
+    resolution branch or a stale install still yields OpenRouter defaults.
+    """
+    if not isinstance(runtime, dict):
+        return runtime
+    base_url = str(runtime.get("base_url") or "").strip()
+    api_key = str(runtime.get("api_key") or "").strip()
+    if "openrouter.ai" not in base_url.lower():
+        return runtime
+    if has_usable_secret(api_key):
+        return runtime
+    if (explicit_base_url or "").strip():
+        return runtime
+    ds = os.getenv("DEEPSEEK_API_KEY", "")
+    if not has_usable_secret(ds):
+        return runtime
+
+    p_ds = PROVIDER_REGISTRY.get("deepseek")
+    native = (
+        (p_ds.inference_base_url if p_ds else "https://api.deepseek.com/v1")
+        .strip()
+        .rstrip("/")
+    )
+    out = dict(runtime)
+    out["base_url"] = native
+    out["api_key"] = ds.strip()
+    out["provider"] = "custom"
+    prev = str(runtime.get("source") or "env")
+    out["source"] = f"{prev}+openrouter_to_deepseek"
+    logger.warning(
+        "runtime_provider: OpenRouter URL had no usable API key; "
+        "using native DeepSeek from DEEPSEEK_API_KEY (%s → %s).",
+        base_url,
+        native,
+    )
+    return out
+
+
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
 
@@ -331,12 +377,19 @@ def _resolve_named_custom_runtime(
     if pool_result:
         return pool_result
 
+    base_l = base_url.lower()
     api_key_candidates = [
         (explicit_api_key or "").strip(),
         str(custom_provider.get("api_key", "") or "").strip(),
-        os.getenv("OPENAI_API_KEY", "").strip(),
-        os.getenv("OPENROUTER_API_KEY", "").strip(),
     ]
+    if "deepseek.com" in base_l:
+        api_key_candidates.append(os.getenv("DEEPSEEK_API_KEY", "").strip())
+    api_key_candidates.extend(
+        [
+            os.getenv("OPENAI_API_KEY", "").strip(),
+            os.getenv("OPENROUTER_API_KEY", "").strip(),
+        ]
+    )
     api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
 
     return {
@@ -378,6 +431,26 @@ def _resolve_openrouter_runtime(
         if requested_norm == "auto":
             if not cfg_provider or cfg_provider == "auto":
                 use_config_base_url = True
+            elif cfg_provider == "openrouter":
+                # model.provider: openrouter with model.base_url → DeepSeek/Together/etc.
+                # Previously ignored when requested resolved to "auto", so we hit
+                # openrouter.ai with no OPENROUTER_API_KEY (401 Missing Authentication).
+                use_config_base_url = True
+        elif requested_norm == "openrouter":
+            # Honor YAML base_url for OpenRouter-style routing, but ignore
+            # another product's endpoint (e.g. stale openai-codex base_url left
+            # in model.base_url while HERMES_INFERENCE_PROVIDER=openrouter).
+            _prov = cfg_provider
+            _foreign_base = _prov in (
+                "openai-codex",
+                "anthropic",
+                "nous",
+                "qwen-oauth",
+                "copilot",
+                "copilot-acp",
+                "huggingface",
+            )
+            use_config_base_url = not _foreign_base
         elif requested_norm == "custom" and cfg_provider == "custom":
             use_config_base_url = True
 
@@ -395,20 +468,36 @@ def _resolve_openrouter_runtime(
     # provider (issues #420, #560).
     _is_openrouter_url = "openrouter.ai" in base_url
     if _is_openrouter_url:
+        # Never use OPENAI_API_KEY for openrouter.ai — OpenRouter only accepts
+        # OPENROUTER_API_KEY (or config model.api_key).  Sending an OpenAI key
+        # produced HTTP 401 "Missing Authentication header" while auxiliary
+        # paths still worked with DEEPSEEK_API_KEY (#289 was about *priority*
+        # when both OR + OpenAI keys exist, not using OpenAI as an OR substitute).
         api_key_candidates = [
             explicit_api_key,
+            (cfg_api_key if use_config_base_url else ""),
             os.getenv("OPENROUTER_API_KEY"),
-            os.getenv("OPENAI_API_KEY"),
         ]
     else:
         # Custom endpoint: use api_key from config when using config base_url (#1760).
         # When the endpoint is Ollama Cloud, check OLLAMA_API_KEY — it's
         # the canonical env var for ollama.com authentication.
         _is_ollama_url = "ollama.com" in base_url.lower()
+        base_lower = base_url.lower()
+        # OpenRouter-style resolution is also used for arbitrary OpenAI-compatible URLs.
+        # Explore UI / control plane store DeepSeek keys in DEEPSEEK_API_KEY; without this,
+        # a config that points base_url at api.deepseek.com but leaves provider as
+        # openrouter/auto would send requests with no Authorization header (401).
+        _is_deepseek_url = "deepseek.com" in base_lower
         api_key_candidates = [
             explicit_api_key,
             (cfg_api_key if use_config_base_url else ""),
             (os.getenv("OLLAMA_API_KEY") if _is_ollama_url else ""),
+            *(
+                [os.getenv("DEEPSEEK_API_KEY")]
+                if _is_deepseek_url
+                else []
+            ),
             os.getenv("OPENAI_API_KEY"),
             os.getenv("OPENROUTER_API_KEY"),
         ]
@@ -417,6 +506,47 @@ def _resolve_openrouter_runtime(
         "",
     )
 
+    # Would hit openrouter.ai with no Authorization → 401.  Common when
+    # OPENAI_API_KEY is set for vision/auxiliary, config.provider is openrouter,
+    # model.default is empty/mis-merged, and only DEEPSEEK_API_KEY is populated
+    # (Explore UI).  Route to native DeepSeek when the configured model slug
+    # clearly targets DeepSeek — do not override an explicit openrouter.ai URL.
+    rescued_deepseek = False
+    if (
+        _is_openrouter_url
+        and not has_usable_secret(api_key)
+        and not (explicit_base_url or "").strip()
+    ):
+        default_m = ""
+        if isinstance(model_cfg, dict):
+            raw = model_cfg.get("default") or model_cfg.get("model") or ""
+            if isinstance(raw, str):
+                default_m = raw.strip().lower()
+        ds_key = os.getenv("DEEPSEEK_API_KEY", "")
+        or_key_ok = has_usable_secret(os.getenv("OPENROUTER_API_KEY", ""))
+        hinted_deepseek = bool(default_m) and (
+            default_m.startswith("deepseek/")
+            or default_m in ("deepseek-chat", "deepseek-reasoner")
+        )
+        # No model slug in config (mis-merge / Explore fragment) but also no
+        # OPENROUTER_API_KEY — only DEEPSEEK is viable for chat (matches agent_pool 401s).
+        empty_model_only_deepseek = (not default_m) and not or_key_ok
+        if has_usable_secret(ds_key) and (hinted_deepseek or empty_model_only_deepseek):
+            p_ds = PROVIDER_REGISTRY.get("deepseek")
+            base_url = (
+                (p_ds.inference_base_url if p_ds else "https://api.deepseek.com/v1")
+                .strip()
+                .rstrip("/")
+            )
+            api_key = ds_key.strip()
+            rescued_deepseek = True
+            _is_openrouter_url = "openrouter.ai" in base_url
+            logger.info(
+                "runtime_provider: OpenRouter endpoint had no usable key; "
+                "using native DeepSeek API (model hint %r, DEEPSEEK_API_KEY).",
+                default_m,
+            )
+
     source = "explicit" if (explicit_api_key or explicit_base_url) else "env/config"
 
     # When "custom" was explicitly requested, preserve that as the provider
@@ -424,6 +554,8 @@ def _resolve_openrouter_runtime(
     # Also provide a placeholder API key for local servers that don't require
     # authentication — the OpenAI SDK requires a non-empty api_key string.
     effective_provider = "custom" if requested_norm == "custom" else "openrouter"
+    if rescued_deepseek:
+        effective_provider = "custom"
 
     # For custom endpoints, check if a credential pool exists
     if effective_provider == "custom" and base_url:
@@ -433,7 +565,8 @@ def _resolve_openrouter_runtime(
         if pool_result:
             return pool_result
 
-    if effective_provider == "custom" and not api_key and not _is_openrouter_url:
+    _openrouter_host = "openrouter.ai" in (base_url or "").lower()
+    if effective_provider == "custom" and not api_key and not _openrouter_host:
         api_key = "no-key-required"
 
     return {
@@ -813,6 +946,10 @@ def resolve_runtime_provider(
     runtime = _resolve_openrouter_runtime(
         requested_provider=requested_provider,
         explicit_api_key=explicit_api_key,
+        explicit_base_url=explicit_base_url,
+    )
+    runtime = sanitize_openrouter_empty_credentials(
+        runtime,
         explicit_base_url=explicit_base_url,
     )
     runtime["requested_provider"] = requested_provider

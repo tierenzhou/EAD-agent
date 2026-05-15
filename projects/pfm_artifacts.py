@@ -182,6 +182,195 @@ def derive_pfm_nodes_from_report_running_step_progress(
     return ordered
 
 
+def _slug_node_key(title: str, fallback: str) -> str:
+    base = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")[:72]
+    return (base or fallback)[:96]
+
+
+def derive_pfm_nodes_from_ascii_tree_text(content: str) -> List[EadFmNodeRun]:
+    """
+    Recover ``EadFmNodeRun`` rows from a textual tree using ``├──`` / ``└──`` and ``│``.
+
+    Supports multi-level trees (Kloud-style). The first non-empty prose line without
+    branch drawing characters becomes the root title.
+    """
+    lines = [ln.rstrip("\n\r") for ln in content.splitlines()]
+    branch_re = re.compile(r"^([\s│|]*)(?:├──|└──)\s*(?:\d+\.\s*)?(.*)$")
+
+    root_title = ""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("```"):
+            continue
+        if re.fullmatch(r"[\s│|]+", line):
+            continue
+        if branch_re.match(line):
+            continue
+        if "──" in stripped:
+            continue
+        if stripped.startswith("#") or stripped.lower() == "mindmap":
+            continue
+        root_title = stripped
+        break
+
+    if not root_title:
+        root_title = "Product"
+
+    rk = _slug_node_key(root_title, "pfm-root")
+    runs: List[EadFmNodeRun] = [
+        EadFmNodeRun(
+            node_id=rk,
+            node_key=rk,
+            parent_node_key=None,
+            level=1,
+            type="product-area",
+            title=root_title[:240],
+            status=TestCaseStepRunStatus.NO_RUN,
+            test_case_runs=[],
+        )
+    ]
+    used: Set[str] = {rk}
+    stack: List[tuple[int, str]] = [(0, rk)]
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("```"):
+            continue
+        if re.fullmatch(r"[\s│|]+", line):
+            continue
+        m = branch_re.match(line)
+        if not m:
+            continue
+        prefix, label = m.group(1), m.group(2).strip()
+        if not label:
+            continue
+        norm_prefix = prefix.replace("|", "│")
+        depth = 1 + norm_prefix.count("│")
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        parent_key = stack[-1][1] if stack else rk
+        slug = _slug_node_key(label, f"n{len(runs)}")
+        nk = f"{parent_key}/{slug}" if parent_key else slug
+        if len(nk) > 200:
+            nk = nk[-200:]
+        base = nk
+        i = 0
+        while nk in used:
+            i += 1
+            nk = f"{base}-d{i}"[-200:]
+        used.add(nk)
+        runs.append(
+            EadFmNodeRun(
+                node_id=nk,
+                node_key=nk,
+                parent_node_key=parent_key,
+                level=min(64, depth + 1),
+                type="feature-area",
+                title=label[:240],
+                status=TestCaseStepRunStatus.NO_RUN,
+                test_case_runs=[],
+            )
+        )
+        stack.append((depth, nk))
+
+    return runs if len(runs) > 1 else []
+
+
+def derive_pfm_nodes_from_mermaid_mindmap_text(content: str) -> List[EadFmNodeRun]:
+    """
+    Recover ``EadFmNodeRun`` rows from Mermaid ``mindmap`` text (``root((...))`` and ``(...)`` nodes).
+
+    Lines without leading node shapes (e.g. ``Status:`` continuations) are skipped.
+    """
+    runs: List[EadFmNodeRun] = []
+    stack: List[tuple[int, str]] = []
+
+    for raw in content.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("```"):
+            continue
+        s = raw.rstrip("\n")
+        leading = len(s) - len(s.lstrip(" "))
+        rest = s.lstrip(" ")
+        if rest == "mindmap":
+            continue
+        if not (rest.startswith("(") or rest.startswith("root((")):
+            continue
+        label: Optional[str] = None
+        m = re.search(r"root\(\((.+?)\)\)", rest)
+        if m:
+            label = m.group(1).strip()
+        else:
+            m2 = re.match(r"\(\((.+?)\)\)", rest)
+            if m2:
+                label = m2.group(1).strip()
+            else:
+                m3 = re.match(r"\((.+?)\)", rest)
+                if m3:
+                    label = m3.group(1).strip()
+        if not label:
+            continue
+        if "[" in label and "]" in label:
+            label = label.split("[", 1)[0].strip()
+        depth = max(0, leading // 2 - 1) if leading >= 2 else 0
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        parent_key = stack[-1][1] if stack else None
+        nk = _slug_node_key(label, f"mm-{len(runs)}")
+        used_keys = {r.node_key for r in runs}
+        if nk in used_keys:
+            nk = f"{nk}-{len(runs)}"
+        runs.append(
+            EadFmNodeRun(
+                node_id=nk,
+                node_key=nk,
+                parent_node_key=parent_key,
+                level=max(1, depth + 1),
+                type="feature-area",
+                title=label[:240],
+                status=TestCaseStepRunStatus.NO_RUN,
+                test_case_runs=[],
+            )
+        )
+        stack.append((depth, nk))
+    return runs
+
+
+def nodes_from_markdown_fenced_mermaid(md: str) -> List[EadFmNodeRun]:
+    """Extract `` ```mermaid `` blocks and parse mindmap nodes when possible."""
+    if not (md or "").strip():
+        return []
+    for m in re.finditer(r"```mermaid\s*([\s\S]*?)```", md, re.IGNORECASE):
+        inner = (m.group(1) or "").strip()
+        nodes = derive_pfm_nodes_from_mermaid_mindmap_text(inner)
+        if nodes:
+            return nodes
+        nodes = derive_pfm_nodes_from_ascii_tree_text(inner)
+        if nodes:
+            return nodes
+    return []
+
+
+def derive_pfm_nodes_from_saved_mindmap_or_report_text(content: str) -> List[EadFmNodeRun]:
+    """
+    Parse saved PFM mindmap / report text into ``EadFmNodeRun`` rows.
+
+    Tries ASCII tree lines first, then Mermaid ``mindmap`` syntax.
+    """
+    if not (content or "").strip():
+        return []
+    lines = content.splitlines()
+    if any("├──" in ln or "└──" in ln for ln in lines):
+        nodes = derive_pfm_nodes_from_ascii_tree_text(content)
+        if nodes:
+            return nodes
+    if any(ln.strip() == "mindmap" for ln in lines[:12]) or "root((" in content:
+        nodes = derive_pfm_nodes_from_mermaid_mindmap_text(content)
+        if nodes:
+            return nodes
+    return []
+
+
 _AGENT_AUTHORED_ENV = "EAD_PFM_AGENT_AUTHORED"
 
 

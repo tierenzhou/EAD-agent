@@ -328,6 +328,11 @@ _PLACEHOLDER_SECRET_VALUES = {
     "dummy",
     "null",
     "none",
+    # OpenAI SDK requires a non-empty string for local servers; these are not
+    # real credentials — must not satisfy has_usable_secret() for remote APIs
+    # (e.g. OpenRouter would get HTTP 401 Missing Authentication header).
+    "no-key-required",
+    "dummy-key",
 }
 
 
@@ -876,6 +881,20 @@ def _get_config_hint_for_unknown_provider(provider_name: str) -> str:
         return ""
 
 
+def _default_model_slug_for_auto() -> str:
+    """Return ``model.default`` (or shorthand ``model:`` string) from config."""
+    try:
+        raw = read_raw_config() or {}
+        m = raw.get("model")
+        if isinstance(m, str) and m.strip():
+            return m.strip()
+        if isinstance(m, dict):
+            return (str(m.get("default") or m.get("model") or "")).strip()
+    except Exception as exc:
+        logger.debug("Could not read default model from config: %s", exc)
+    return ""
+
+
 def resolve_provider(
     requested: Optional[str] = None,
     *,
@@ -947,6 +966,21 @@ def resolve_provider(
                 return active
     except Exception as e:
         logger.debug("Could not detect active auth provider: %s", e)
+
+    # OPENAI_API_KEY alone used to win before DEEPSEEK_API_KEY was scanned, so a
+    # main model like ``deepseek/deepseek-chat`` with only DEEPSEEK_API_KEY plus
+    # OPENAI_API_KEY for vision routed to openrouter.ai without OPENROUTER_API_KEY
+    # (401 Missing Authentication header).
+    _dm = _default_model_slug_for_auto().strip().lower()
+    if has_usable_secret(os.getenv("DEEPSEEK_API_KEY", "")):
+        _wants_deepseek = _dm.startswith("deepseek/") or _dm in (
+            "deepseek-chat",
+            "deepseek-reasoner",
+        )
+        if _wants_deepseek and not has_usable_secret(
+            os.getenv("OPENROUTER_API_KEY", "")
+        ):
+            return "deepseek"
 
     if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
         return "openrouter"

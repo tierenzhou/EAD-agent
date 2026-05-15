@@ -287,19 +287,31 @@ logger = logging.getLogger(__name__)
 # session from bypassing the "already running" guard during the async gap
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
+_RUNTIME_PROVIDER_LOGGED = False
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
+    global _RUNTIME_PROVIDER_LOGGED
+    import hermes_cli.runtime_provider as _rp_mod
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
+        sanitize_openrouter_empty_credentials,
     )
+
+    if not _RUNTIME_PROVIDER_LOGGED:
+        logger.info(
+            "[gateway] hermes_cli.runtime_provider loaded from %s",
+            getattr(_rp_mod, "__file__", "?"),
+        )
+        _RUNTIME_PROVIDER_LOGGED = True
 
     try:
         runtime = resolve_runtime_provider(
             requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
         )
+        runtime = sanitize_openrouter_empty_credentials(runtime, explicit_base_url=None)
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
@@ -427,10 +439,26 @@ def _resolve_gateway_model(config: Optional[dict] = None) -> str:
     cfg = config if config is not None else _load_gateway_config()
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, str):
-        return model_cfg
+        out = model_cfg.strip()
+        return out
     elif isinstance(model_cfg, dict):
-        return model_cfg.get("default") or model_cfg.get("model") or ""
-    return ""
+        out = (model_cfg.get("default") or model_cfg.get("model") or "")
+        if isinstance(out, str) and out.strip():
+            return out.strip()
+    else:
+        out = ""
+
+    # Dict-shaped model block sometimes omits default after UI merges; align
+    # with auxiliary_client's reader so project agents get a real model id.
+    try:
+        from agent.auxiliary_client import _read_main_model
+
+        m2 = _read_main_model()
+        if isinstance(m2, str) and m2.strip():
+            return m2.strip()
+    except Exception:
+        pass
+    return out if isinstance(out, str) else ""
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:

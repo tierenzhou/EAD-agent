@@ -7,9 +7,9 @@ Port of src/projects/types.ts from EAD-EXP into Pydantic v2 models.
 import time
 import uuid
 from enum import Enum
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 RunPurpose = Literal["live_app_learning", "live_app_testing", "document_analysis"]
 EvidenceSource = Literal["live_app", "document", "hybrid"]
@@ -92,7 +92,15 @@ class TestCaseRun(BaseModel):
 
 
 class EadFmNodeRun(BaseModel):
-    node_id: str
+    """
+    PFM node row persisted on ``ProjectExecute.results``.
+
+    Agents sometimes emit camelCase keys (``nodeKey``) and free-form status
+    strings such as ``verified``; normalize before strict enum validation so
+    SQLite rows and gateway JSON stay loadable.
+    """
+
+    node_id: str = ""
     node_key: str = ""
     parent_node_key: Optional[str] = None
     level: int = 0
@@ -101,6 +109,35 @@ class EadFmNodeRun(BaseModel):
     meta: str = ""
     status: TestCaseStepRunStatus = TestCaseStepRunStatus.NO_RUN
     test_case_runs: List[TestCaseRun] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_agent_payload(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        if "node_key" not in out and "nodeKey" in out:
+            out["node_key"] = out.get("nodeKey")
+        if "node_id" not in out and "nodeId" in out:
+            out["node_id"] = out.get("nodeId")
+        if "parent_node_key" not in out and "parentNodeKey" in out:
+            out["parent_node_key"] = out.get("parentNodeKey")
+        st = out.get("status")
+        if isinstance(st, str):
+            low = st.strip().lower()
+            if low in ("verified", "passed", "complete", "completed", "success", "ok", "true"):
+                out["status"] = TestCaseStepRunStatus.SUCCESS.value
+            elif low in ("failed", "error", "blocked", "false"):
+                out["status"] = TestCaseStepRunStatus.FAILED.value
+            elif low in ("no_run", "pending", "unknown", "not_run", "skipped", ""):
+                out["status"] = TestCaseStepRunStatus.NO_RUN.value
+        nk = str(out.get("node_key") or "").strip()
+        nid = str(out.get("node_id") or "").strip()
+        if not nid and nk:
+            out["node_id"] = nk
+        if not str(out.get("node_id") or "").strip():
+            out["node_id"] = "pfm-node"
+        return out
 
 
 class StepArtifact(BaseModel):
@@ -161,6 +198,11 @@ class ProjectTemplate(BaseModel):
     created_by: str = ""
     last_modified_at: int = Field(default_factory=lambda: int(time.time() * 1000))
     last_modified_by: str = ""
+    # Execution whose committed PFM is the template-wide "most accurate" baseline for UI + new runs.
+    canonical_pfm_execution_id: Optional[str] = None
+    canonical_pfm_promoted_at: Optional[int] = None
+    canonical_pfm_promoted_by: Optional[str] = None  # "ai" | "operator"
+    canonical_pfm_promotion_rationale: Optional[str] = None
 
 
 class ProjectExecute(BaseModel):
@@ -212,6 +254,13 @@ class ProjectExecute(BaseModel):
     bootstrap_pending: bool = False
     bootstrap_inherit_pfm: bool = True
     bootstrap_explicit_inherit_from_execution_id: Optional[str] = None
+    # Canonical PFM promotion (filled after terminal completion + optional AI judge).
+    pfm_canonical_evaluation_status: Optional[str] = None
+    pfm_canonical_replace_recommended: Optional[bool] = None
+    pfm_canonical_evaluation_confidence: Optional[float] = None
+    pfm_canonical_evaluation_rationale: Optional[str] = None
+    pfm_canonical_evaluation_at_ms: Optional[int] = None
+    pfm_canonical_promotion_applied: Optional[bool] = None
 
 
 class ProjectsStoreFile(BaseModel):

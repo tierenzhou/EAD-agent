@@ -11,8 +11,9 @@ Different LLM providers expect model identifiers in different formats:
 - **OpenCode Zen** follows the same dot-to-hyphen convention as
   Anthropic: ``claude-sonnet-4-6``.
 - **OpenCode Go** preserves dots in model names: ``minimax-m2.7``.
-- **DeepSeek** only accepts two model identifiers:
-  ``deepseek-chat`` and ``deepseek-reasoner``.
+- **DeepSeek** native API expects ``deepseek-v4-flash`` or ``deepseek-v4-pro``.
+  Legacy slugs (``deepseek-chat``, ``deepseek-reasoner``, OpenRouter-style
+  ``deepseek/...``) are mapped to those identifiers.
 - **Custom** and remaining providers pass the name through as-is.
 
 This module centralises that translation so callers can simply write::
@@ -109,38 +110,42 @@ _DEEPSEEK_REASONER_KEYWORDS: frozenset[str] = frozenset({
     "cot",
 })
 
-_DEEPSEEK_CANONICAL_MODELS: frozenset[str] = frozenset({
-    "deepseek-chat",
-    "deepseek-reasoner",
-})
+# Native chat/completions API (2025+): only v4 ids are accepted for many keys.
+_DEEPSEEK_V4_FLASH = "deepseek-v4-flash"
+_DEEPSEEK_V4_PRO = "deepseek-v4-pro"
 
 
 def _normalize_for_deepseek(model_name: str) -> str:
-    """Map any model input to one of DeepSeek's two accepted identifiers.
+    """Map any model input to DeepSeek native API model identifiers.
 
     Rules:
-    - Already ``deepseek-chat`` or ``deepseek-reasoner`` -> pass through.
+    - Already ``deepseek-v4-flash`` or ``deepseek-v4-pro`` -> pass through.
+    - Legacy ``deepseek-chat`` / ``deepseek-reasoner`` -> v4 flash / v4 pro.
     - Contains any reasoner keyword (r1, think, reasoning, cot, reasoner)
-      -> ``deepseek-reasoner``.
-    - Everything else -> ``deepseek-chat``.
+      -> ``deepseek-v4-pro``.
+    - Everything else -> ``deepseek-v4-flash``.
 
     Args:
         model_name: The bare model name (vendor prefix already stripped).
 
     Returns:
-        One of ``"deepseek-chat"`` or ``"deepseek-reasoner"``.
+        ``deepseek-v4-flash`` or ``deepseek-v4-pro``.
     """
     bare = _strip_vendor_prefix(model_name).lower()
 
-    if bare in _DEEPSEEK_CANONICAL_MODELS:
+    if bare in (_DEEPSEEK_V4_FLASH, _DEEPSEEK_V4_PRO):
         return bare
+    if bare == "deepseek-chat":
+        return _DEEPSEEK_V4_FLASH
+    if bare == "deepseek-reasoner":
+        return _DEEPSEEK_V4_PRO
 
     # Check for reasoner-like keywords anywhere in the name
     for keyword in _DEEPSEEK_REASONER_KEYWORDS:
         if keyword in bare:
-            return "deepseek-reasoner"
+            return _DEEPSEEK_V4_PRO
 
-    return "deepseek-chat"
+    return _DEEPSEEK_V4_FLASH
 
 
 # ---------------------------------------------------------------------------
@@ -329,10 +334,10 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
         'claude-sonnet-4-6'
 
         >>> normalize_model_for_provider("deepseek-v3", "deepseek")
-        'deepseek-chat'
+        'deepseek-v4-flash'
 
         >>> normalize_model_for_provider("deepseek-r1", "deepseek")
-        'deepseek-reasoner'
+        'deepseek-v4-pro'
 
         >>> normalize_model_for_provider("my-model", "custom")
         'my-model'
@@ -341,10 +346,12 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
         'claude-sonnet-4.6'
     """
     name = (model_input or "").strip()
-    if not name:
-        return name
-
     provider = _normalize_provider_alias(target_provider)
+
+    if not name:
+        if provider == "deepseek":
+            return _normalize_for_deepseek("deepseek-chat")
+        return name
 
     # --- Aggregators: need vendor/model format ---
     if provider in _AGGREGATOR_PROVIDERS:

@@ -410,12 +410,16 @@ def _path_to_root(node_key: str, by_key: Dict[str, Dict[str, Any]]) -> List[Dict
 
 
 def _mermaid_label(node: Dict[str, Any]) -> str:
+    """
+    Mindmap node text for Mermaid ``mindmap`` output.
+
+    Use **title only** (no trailing ``[status]``): bracketed suffixes confuse Mermaid
+    mindmap rendering and often collapse to misleading single-word boxes.
+    """
     raw = str(node.get("title") or node.get("node_key") or "node").strip().replace("\n", " ")
     if len(raw) > 92:
         raw = raw[:89] + "..."
-    raw = raw.replace("(", "[").replace(")", "]").replace('"', "'")
-    status = str(node.get("status") or "No Run").strip() or "No Run"
-    return f"{raw} [{status}]"
+    return raw.replace("(", "[").replace(")", "]").replace('"', "'")
 
 
 def _emit_subtree(
@@ -451,20 +455,40 @@ def render_mermaid_for_scope(
     by_key = _index_flat(flat)
     children = _children_index(flat)
 
-    root_title = (execution.name or execution.id or "PFM Run").replace("\n", " ").strip()
-    if len(root_title) > 80:
-        root_title = root_title[:77] + "..."
-    root_title = root_title.replace("(", "[").replace(")", "]")
-    lines = ["mindmap", f"  root(({root_title}))"]
-
     if not flat:
+        root_title = (execution.name or execution.id or "PFM Run").replace("\n", " ").strip()
+        if len(root_title) > 80:
+            root_title = root_title[:77] + "..."
+        root_title = root_title.replace("(", "[").replace(")", "]")
+        lines = ["mindmap", f"  root(({root_title}))"]
         lines.append("    No PFM tree committed yet")
         return "\n".join(lines) + "\n"
 
     s = (scope or "top").strip().lower()
+    if s == "focus" and node_key and node_key in by_key:
+        root_title = _mermaid_label(by_key[node_key])
+    else:
+        root_title = (execution.name or execution.id or "PFM Run").replace("\n", " ").strip()
+        if len(root_title) > 80:
+            root_title = root_title[:77] + "..."
+        root_title = root_title.replace("(", "[").replace(")", "]")
+    lines = ["mindmap", f"  root(({root_title}))"]
     emitted: set = set()
 
     if s == "top":
+        roots = children.get(None, [])
+        for r in roots:
+            _emit_subtree(lines, r, 1, children, 1, emitted)
+        return "\n".join(lines) + "\n"
+
+    if s == "focus":
+        if node_key:
+            if node_key not in by_key:
+                return "\n".join(lines + [f"    Unknown node_key: {node_key}"]) + "\n"
+            # In focus mode, selected node is the center root; render one child level only.
+            for child in children.get(node_key, []) or []:
+                _emit_subtree(lines, child, 1, children, 1, emitted)
+            return "\n".join(lines) + "\n"
         roots = children.get(None, [])
         for r in roots:
             _emit_subtree(lines, r, 1, children, 1, emitted)
@@ -517,7 +541,9 @@ def apply_view_state_to_tree(
         view_state = {}
     node_path = [str(k).strip() for k in (view_state.get("node_path") or []) if str(k).strip()]
     selected = str(view_state.get("selected_node_key") or "").strip()
-    scope = str(view_state.get("view_scope") or "top").strip().lower() or "top"
+    scope = str(view_state.get("view_scope") or "focus").strip().lower() or "focus"
+    if scope not in {"focus", "top", "subtree", "full", "path"}:
+        scope = "focus"
     try:
         depth_cap = int(view_state.get("depth_cap") or 2)
     except Exception:
@@ -530,10 +556,11 @@ def apply_view_state_to_tree(
     new_path: List[str] = []
     if new_selected:
         new_path = [n["node_key"] for n in _path_to_root(new_selected, by_key)]
-        if scope == "top":
-            scope = "subtree"
+        if scope in {"top", "path"}:
+            scope = "focus"
     else:
-        scope = "top"
+        if scope in {"subtree", "path"}:
+            scope = "focus"
 
     return {
         "node_path": new_path,

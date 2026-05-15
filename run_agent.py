@@ -874,6 +874,15 @@ class AIAgent:
                 if effective_key and len(effective_key) > 12:
                     print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
         else:
+            # Tests (and rare CLI invocations) pass api_key without base_url.
+            # Without a base_url we would fall through to OpenRouter resolution and
+            # then the empty-key fallback — use a non-routable stub URL instead.
+            from hermes_cli.auth import has_usable_secret as _hsk_bootstrap
+
+            if _hsk_bootstrap(str(api_key or "").strip()) and not str(base_url or "").strip():
+                base_url = "http://127.0.0.1:9/v1"
+                self.base_url = base_url
+                self._base_url_lower = base_url.lower()
             if api_key and base_url:
                 # Explicit credentials from CLI/gateway — construct directly.
                 # The runtime provider resolver already handled auth for us.
@@ -902,7 +911,12 @@ class AIAgent:
                 # No explicit creds — use the centralized provider router
                 from agent.auxiliary_client import resolve_provider_client
                 _routed_client, _ = resolve_provider_client(
-                    self.provider or "auto", model=self.model, raw_codex=True)
+                    self.provider or "auto",
+                    model=self.model,
+                    raw_codex=True,
+                    explicit_base_url=base_url or None,
+                    explicit_api_key=api_key or None,
+                )
                 if _routed_client is not None:
                     client_kwargs = {
                         "api_key": _routed_client.api_key,
@@ -922,17 +936,77 @@ class AIAgent:
                             f"was found. Set the {_explicit.upper()}_API_KEY environment "
                             f"variable, or switch to a different provider with `hermes model`."
                         )
-                    # Final fallback: try raw OpenRouter key
-                    client_kwargs = {
-                        "api_key": os.getenv("OPENROUTER_API_KEY", ""),
+                    # Never fall back to openrouter.ai with an empty OPENROUTER_API_KEY —
+                    # OpenRouter returns HTTP 401 "Missing Authentication header" and
+                    # users misread it as "gateway did not load .env".  Prefer DEEPSEEK_API_KEY
+                    # via runtime_provider.sanitize, or fail loud.
+                    from hermes_cli.auth import has_usable_secret as _husk
+                    from hermes_cli.runtime_provider import (
+                        sanitize_openrouter_empty_credentials as _orc_sanitize,
+                    )
+
+                    _probe = {
                         "base_url": OPENROUTER_BASE_URL,
-                        "default_headers": {
-                            "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-                            "X-OpenRouter-Title": "Hermes Agent",
-                            "X-OpenRouter-Categories": "productivity,cli-agent",
-                        },
+                        "api_key": os.getenv("OPENROUTER_API_KEY", ""),
+                        "provider": "openrouter",
+                        "source": "agent_init_fallback",
                     }
-            
+                    _probe = _orc_sanitize(_probe, explicit_base_url=base_url or None)
+                    if _husk(_probe.get("api_key")):
+                        client_kwargs = {
+                            "api_key": _probe["api_key"],
+                            "base_url": _probe["base_url"],
+                        }
+                        if "openrouter" in str(_probe["base_url"]).lower():
+                            client_kwargs["default_headers"] = {
+                                "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+                                "X-OpenRouter-Title": "Hermes Agent",
+                                "X-OpenRouter-Categories": "productivity,cli-agent",
+                            }
+                    else:
+                        raise RuntimeError(
+                            "No inference API key available for the default OpenRouter "
+                            "endpoint. Set OPENROUTER_API_KEY, or set DEEPSEEK_API_KEY for "
+                            "DeepSeek-native routing, then restart the gateway. "
+                            "(Requests to https://openrouter.ai without a Bearer token "
+                            "always return HTTP 401.)"
+                        )
+
+            # Last line of defence: never attach an OpenAI client to openrouter.ai
+            # with a blank / placeholder api_key (any code path above).
+            from hermes_cli.auth import has_usable_secret as _husk2
+            from hermes_cli.runtime_provider import (
+                sanitize_openrouter_empty_credentials as _orc_sanitize2,
+            )
+
+            _rt = {
+                "base_url": str(client_kwargs.get("base_url") or ""),
+                "api_key": str(client_kwargs.get("api_key") or ""),
+                "provider": self.provider or "",
+                "source": "agent_init",
+            }
+            _rt2 = _orc_sanitize2(_rt, explicit_base_url=base_url or None)
+            client_kwargs["base_url"] = _rt2.get("base_url", client_kwargs.get("base_url"))
+            client_kwargs["api_key"] = _rt2.get("api_key", client_kwargs.get("api_key"))
+            if "deepseek.com" in str(client_kwargs.get("base_url") or "").lower():
+                self.provider = "custom"
+                try:
+                    from hermes_cli.model_normalize import (
+                        normalize_model_for_provider as _nmp_ds,
+                    )
+
+                    self.model = _nmp_ds(self.model or "", "deepseek")
+                except Exception:
+                    pass
+            if (
+                "openrouter.ai" in str(client_kwargs.get("base_url") or "").lower()
+                and not _husk2(client_kwargs.get("api_key"))
+            ):
+                raise RuntimeError(
+                    "Refusing to start OpenAI client: openrouter.ai with no usable API key. "
+                    "Set OPENROUTER_API_KEY or DEEPSEEK_API_KEY in the gateway environment."
+                )
+
             self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
             # Enable fine-grained tool streaming for Claude on OpenRouter.

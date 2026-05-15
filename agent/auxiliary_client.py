@@ -106,6 +106,7 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
     "opencode-zen": "gemini-3-flash",
     "opencode-go": "glm-5",
     "kilocode": "google/gemini-3-flash-preview",
+    "deepseek": "deepseek-v4-flash",
 }
 
 # OpenRouter app attribution headers
@@ -898,8 +899,29 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
     # Use a placeholder key — the OpenAI SDK requires a non-empty string but
     # local servers ignore the Authorization header.  Same fix as cli.py
     # _ensure_runtime_credentials() (PR #2556).
+    #
+    # Remote OpenAI-compatible hosts (e.g. api.deepseek.com) must NOT use this
+    # placeholder: resolve_runtime_provider(requested="custom") can return a
+    # DeepSeek base URL with an empty api_key before env keys are applied.
+    # Returning a client here would short-circuit the auxiliary chain before
+    # _resolve_api_key_provider() can attach DEEPSEEK_API_KEY → 401 Missing
+    # Authentication header on flush_memories / compression.
     if not isinstance(custom_key, str) or not custom_key.strip():
-        custom_key = "no-key-required"
+        base_lower = custom_base.lower()
+        localish = any(
+            marker in base_lower
+            for marker in (
+                "localhost",
+                "127.0.0.1",
+                "0.0.0.0",
+                "::1",
+                "host.docker.internal",
+            )
+        ) or ".local" in base_lower
+        if localish:
+            custom_key = "no-key-required"
+        else:
+            return None, None, None
 
     if not isinstance(custom_mode, str) or not custom_mode.strip():
         custom_mode = None
@@ -1247,6 +1269,21 @@ def resolve_provider_client(
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
 
+    # Gateway / AIAgent may pass base_url from resolve_runtime_provider while
+    # api_key is still empty (e.g. openrouter + DeepSeek host). The branches
+    # below for "openrouter" / "deepseek" ignore explicit_base_url — route
+    # through the custom explicit-endpoint path which merges env keys by host.
+    eb = (explicit_base_url or "").strip()
+    if eb and provider != "custom":
+        return resolve_provider_client(
+            "custom",
+            model=model,
+            async_mode=async_mode,
+            raw_codex=raw_codex,
+            explicit_base_url=eb,
+            explicit_api_key=(explicit_api_key or "").strip() or None,
+        )
+
     # ── Auto: try all providers in priority order ────────────────────
     if provider == "auto":
         client, resolved = _resolve_auto()
@@ -1314,17 +1351,45 @@ def resolve_provider_client(
     if provider == "custom":
         if explicit_base_url:
             custom_base = explicit_base_url.strip()
-            custom_key = (
-                (explicit_api_key or "").strip()
-                or os.getenv("OPENAI_API_KEY", "").strip()
-                or "no-key-required"  # local servers don't need auth
-            )
             if not custom_base:
                 logger.warning(
                     "resolve_provider_client: explicit custom endpoint requested "
                     "but base_url is empty"
                 )
                 return None, None
+            custom_key = (explicit_api_key or "").strip()
+            if not custom_key:
+                bl = custom_base.lower()
+                if "deepseek.com" in bl:
+                    custom_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+                elif "openrouter.ai" in bl:
+                    custom_key = (
+                        os.getenv("OPENROUTER_API_KEY", "").strip()
+                        or os.getenv("OPENAI_API_KEY", "").strip()
+                    )
+                else:
+                    custom_key = os.getenv("OPENAI_API_KEY", "").strip()
+            if not custom_key:
+                bl = custom_base.lower()
+                localish = any(
+                    m in bl
+                    for m in (
+                        "localhost",
+                        "127.0.0.1",
+                        "0.0.0.0",
+                        "::1",
+                        "host.docker.internal",
+                    )
+                ) or ".local" in bl
+                if localish:
+                    custom_key = "no-key-required"
+                else:
+                    logger.warning(
+                        "resolve_provider_client: explicit endpoint %s has no API key "
+                        "(set DEEPSEEK_API_KEY, OPENAI_API_KEY, or OPENROUTER_API_KEY)",
+                        custom_base,
+                    )
+                    return None, None
             final_model = _normalize_resolved_model(
                 model or _read_main_model() or "gpt-4o-mini",
                 provider,

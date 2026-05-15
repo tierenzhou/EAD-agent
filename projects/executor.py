@@ -16,7 +16,7 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from .models import ExecutionStatus, ProgressLogEntry, ProjectExecute, StepResult
 from .store import ProjectStore
@@ -50,7 +50,22 @@ _COOLDOWN_MAX_S = 60.0
 _SUCCESS_COUNT_TO_DECREASE = 5
 _RECOVERY_WINDOW_S = 600
 _POLL_INTERVAL_S = 1.2
-_PROGRESS_REPORT_INTERVAL_S = 15
+_PROGRESS_REPORT_INTERVAL_S = 15.0
+# Executor-authored "📊 Progress Update" chat posts (text summary from progress_log).
+# Disabled by default after operator feedback; set EAD_EXECUTOR_PROGRESS_CHAT=1 to re-enable.
+# Interval in seconds (min 15); e.g. EAD_PROGRESS_REPORT_INTERVAL_S=120 for ~2-minute cadence.
+_EXECUTOR_PROGRESS_CHAT = (os.getenv("EAD_EXECUTOR_PROGRESS_CHAT", "") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_raw_pr_int = (os.getenv("EAD_PROGRESS_REPORT_INTERVAL_S") or "").strip()
+if _raw_pr_int:
+    try:
+        _PROGRESS_REPORT_INTERVAL_S = max(15.0, float(_raw_pr_int))
+    except ValueError:
+        pass
 _STALL_INTERRUPT_S = 90.0
 # Optional timed regeneration of published PFM artifacts (accuracy still comes primarily
 # from progress-driven sync + terminal force-sync). 0/disabled by default — set e.g.
@@ -375,17 +390,23 @@ class ProjectExecutor:
         self._last_progress_activity_ts: Dict[str, float] = {}
         self._last_pfm_periodic_ts: Dict[str, float] = {}
         self._pfm_refresh_nudge_ts: Dict[str, float] = {}
+        # Operator clicked Refresh while run_conversation was in-flight — flush on next idle tick.
+        self._pending_pfm_snapshot_refresh: Set[str] = set()
 
     def request_pfm_snapshot_refresh(self, execution_id: str) -> Dict[str, object]:
         """Ask the session agent (async) to call commit_pfm_snapshot for the mindmap UI."""
         execution = self._store.get_execution(execution_id)
         if not execution:
             return {"ok": False, "code": "not_found"}
-        if execution.status not in (ExecutionStatus.RUNNING, ExecutionStatus.PENDING):
+        if execution.status not in (
+            ExecutionStatus.RUNNING,
+            ExecutionStatus.PENDING,
+            ExecutionStatus.COMPLETED,
+        ):
             return {
                 "ok": False,
                 "code": "execution_not_active",
-                "message": "Snapshot refresh is only available while the run is pending or running.",
+                "message": "Snapshot refresh is only available for pending, running, or completed runs.",
             }
         if execution.bootstrap_pending:
             return {
@@ -400,11 +421,20 @@ class ProjectExecutor:
                 "code": "no_session",
                 "message": "Run session is not ready yet; try again shortly.",
             }
+        if execution.status == ExecutionStatus.COMPLETED:
+            committed = self._store.get_committed_pfm_tree(execution_id)
+            if self._completed_refresh_has_no_changes(execution, committed):
+                return {
+                    "ok": True,
+                    "code": "no_changes",
+                    "message": "No PFM changes detected since the last committed snapshot.",
+                }
         if self._pool.is_agent_active(sk):
+            self._pending_pfm_snapshot_refresh.add(execution_id)
             return {
-                "ok": False,
-                "code": "agent_busy",
-                "message": "Agent is processing another turn; try Refresh again in a few seconds.",
+                "ok": True,
+                "code": "queued_deferred",
+                "message": "Agent is mid-turn; snapshot refresh is queued and starts when this turn ends.",
             }
         now = time.time()
         last = self._pfm_refresh_nudge_ts.get(execution_id, 0.0)
@@ -436,6 +466,109 @@ class ProjectExecutor:
             run_id,
         )
         return {"ok": True, "code": "queued", "run_id": run_id}
+
+    def _completed_refresh_has_no_changes(
+        self,
+        execution: ProjectExecute,
+        committed_snapshot: Optional[Dict[str, object]],
+    ) -> bool:
+        """Best-effort no-op detection for completed runs.
+
+        Compare the committed snapshot's flat nodes against ``execution.results``.
+        If signatures match exactly, a refresh nudge is likely unnecessary.
+        """
+        if not isinstance(committed_snapshot, dict):
+            return False
+        flat = committed_snapshot.get("flat_nodes")
+        if not isinstance(flat, list) or not flat:
+            return False
+        results = list(getattr(execution, "results", []) or [])
+        if not results:
+            return False
+
+        def _norm_status(v: object) -> str:
+            raw = getattr(v, "value", v)
+            text = str(raw or "").strip().lower()
+            if "." in text:
+                text = text.split(".")[-1]
+            if text in ("passed", "complete", "completed", "ok", "true"):
+                return "success"
+            if text in ("error", "blocked", "false"):
+                return "failed"
+            if text in ("pending", "not_run", "skipped", "unknown"):
+                return "no run"
+            return text
+
+        def _norm_level(v: object) -> int:
+            try:
+                return int(v or 0)
+            except Exception:
+                return 0
+
+        def _snap_sig(n: object) -> tuple:
+            if not isinstance(n, dict):
+                return ("", "", 0, "", "", "")
+            return (
+                str(n.get("node_key") or "").strip(),
+                str(n.get("parent_node_key") or "").strip(),
+                _norm_level(n.get("level")),
+                str(n.get("title") or "").strip(),
+                _norm_status(n.get("status")),
+                str(n.get("description") or "").strip(),
+            )
+
+        def _run_sig(n: object) -> tuple:
+            return (
+                str(getattr(n, "node_key", "") or "").strip(),
+                str(getattr(n, "parent_node_key", "") or "").strip(),
+                _norm_level(getattr(n, "level", 0)),
+                str(getattr(n, "title", "") or "").strip(),
+                _norm_status(getattr(n, "status", "")),
+                str(getattr(n, "meta", "") or "").strip(),
+            )
+
+        snap_sig = sorted(_snap_sig(n) for n in flat)
+        run_sig = sorted(_run_sig(n) for n in results)
+        if not snap_sig or not run_sig:
+            return False
+        return snap_sig == run_sig
+
+    def _dispatch_pending_pfm_snapshot_refresh(self, execution_id: str) -> bool:
+        """If operator requested a mindmap refresh while the agent was busy, run it now."""
+        if execution_id not in self._pending_pfm_snapshot_refresh:
+            return False
+        execution = self._store.get_execution(execution_id)
+        if not execution or execution.status not in (ExecutionStatus.RUNNING, ExecutionStatus.PENDING):
+            self._pending_pfm_snapshot_refresh.discard(execution_id)
+            return False
+        sk = (execution.run_session_key or "").strip()
+        if not sk or self._pool.is_agent_active(sk):
+            return False
+        now = time.time()
+        last = self._pfm_refresh_nudge_ts.get(execution_id, 0.0)
+        if now - last < _PFM_REFRESH_NUDGE_MIN_INTERVAL_S:
+            return False
+        self._pending_pfm_snapshot_refresh.discard(execution_id)
+        self._pfm_refresh_nudge_ts[execution_id] = now
+        boundary = self._project_boundary_prompt(execution)
+        user_message = (
+            "[Operator UI — Refresh PFM mindmap] Call commit_pfm_snapshot now for this execution "
+            f"({execution_id}). Publish the full current PFM tree plus node_reports. "
+            "Set `version` strictly higher than the latest committed snapshot for this run. "
+            "Reply with a one-line confirmation when done."
+        )
+        run_id = self._pool.send_message_async(
+            session_key=sk,
+            user_message=user_message,
+            ephemeral_system_prompt=boundary,
+            enable_tools=True,
+        )
+        logger.info(
+            "[executor] Dispatched deferred PFM snapshot refresh for execution %s (async run %s)",
+            execution_id,
+            run_id,
+        )
+        return True
 
     async def start_execution(self, execution_id: str) -> None:
         if self.has_active_monitor(execution_id):
@@ -611,7 +744,8 @@ class ProjectExecutor:
                             agent_active = False
 
                     if not agent_active and execution.status == ExecutionStatus.RUNNING:
-                        await self._auto_continue(execution_id)
+                        if not self._dispatch_pending_pfm_snapshot_refresh(execution_id):
+                            await self._auto_continue(execution_id)
 
                     await self._check_budget(execution_id)
                     await self._report_progress_to_chat(execution_id, session_key)
@@ -657,6 +791,7 @@ class ProjectExecutor:
         self._last_progress_seq_seen.pop(execution_id, None)
         self._last_progress_activity_ts.pop(execution_id, None)
         self._last_pfm_periodic_ts.pop(execution_id, None)
+        self._pending_pfm_snapshot_refresh.discard(execution_id)
 
         if sk:
             _cleanup_browser_for_session(sk)
@@ -1457,9 +1592,26 @@ class ProjectExecutor:
                 exc,
             )
 
+        try:
+            from projects.pfm_canonical_judge import evaluate_and_maybe_promote_after_completion
+
+            result = await evaluate_and_maybe_promote_after_completion(self._store, execution_id)
+            if result.get("promoted"):
+                logger.info(
+                    "[executor] Canonical PFM promoted for template via execution %s: %s",
+                    execution_id,
+                    result,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[executor] Canonical PFM evaluation/promotion failed for %s: %s",
+                execution_id,
+                exc,
+            )
+
     async def _report_progress_to_chat(self, execution_id: str, session_key: str) -> None:
-        # User requested agent-native updates only; suppress executor-authored chat summaries.
-        return
+        if not _EXECUTOR_PROGRESS_CHAT:
+            return
         now = time.time()
         last_report = self._last_progress_report_ts.get(execution_id, 0)
         if now - last_report < _PROGRESS_REPORT_INTERVAL_S:
@@ -1650,6 +1802,7 @@ class ProjectExecutor:
         cancel_reason: Optional[str] = None,
     ) -> None:
         self._cancelled.add(execution_id)
+        self._pending_pfm_snapshot_refresh.discard(execution_id)
         event = self._abort_events.get(execution_id)
         if event:
             event.set()
