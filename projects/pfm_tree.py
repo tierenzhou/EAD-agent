@@ -34,9 +34,75 @@ PFM_TREE_ARTIFACT_TYPE = "pfm_tree"
 PFM_VIEW_STATE_ARTIFACT_KEY = "pfm-view-state.json"
 PFM_VIEW_STATE_ARTIFACT_TYPE = "pfm_view_state"
 
+# Committed tree + view state belong to one execution; never copy on PFM seed/inherit.
+NON_INHERITABLE_PFM_ARTIFACT_TYPES = frozenset(
+    {PFM_TREE_ARTIFACT_TYPE, PFM_VIEW_STATE_ARTIFACT_TYPE}
+)
+
 NODE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-./]*$")
 MAX_TREE_DEPTH = 24
 MAX_NODES = 5000
+
+
+def snapshot_generation(snap: Optional[Dict[str, Any]]) -> int:
+    """Template PFM generation (e.g. 10). Zero when absent on legacy snapshots."""
+    if not isinstance(snap, dict):
+        return 0
+    try:
+        gen = int(snap.get("generation") or 0)
+    except Exception:
+        gen = 0
+    return gen if gen > 0 else 0
+
+
+def snapshot_revision(snap: Optional[Dict[str, Any]]) -> int:
+    """Within-run revision (Rev 1, Rev 2, …). Legacy snapshots used ``version`` only."""
+    if not isinstance(snap, dict):
+        return 0
+    try:
+        rev = int(snap.get("revision") or 0)
+    except Exception:
+        rev = 0
+    try:
+        ver = int(snap.get("version") or 0)
+    except Exception:
+        ver = 0
+    if rev > 0:
+        return max(rev, ver) if ver > rev else rev
+    return ver if ver > 0 else 0
+
+
+def snapshot_finalized(snap: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(snap, dict):
+        return False
+    return bool(snap.get("finalized"))
+
+
+def baseline_generation_from_snap(snap: Optional[Dict[str, Any]]) -> int:
+    """
+    Generation on a prior run's tree (for v9 → v10).
+
+    Legacy trees stored only ``version``; on canonical/baseline runs that counter
+  often equals template generation.
+    """
+    gen = snapshot_generation(snap)
+    if gen > 0:
+        return gen
+    if not isinstance(snap, dict):
+        return 0
+    try:
+        return int(snap.get("version") or 0)
+    except Exception:
+        return 0
+
+
+def snapshot_has_committed_tree(snap: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(snap, dict):
+        return False
+    flat = snap.get("flat_nodes") or snap.get("flatNodes") or []
+    if not isinstance(flat, list) or len(flat) == 0:
+        return False
+    return snapshot_generation(snap) > 0 or snapshot_revision(snap) > 0
 
 
 def _slugify_for_artifact_key(value: str) -> str:
@@ -83,12 +149,14 @@ def committed_tree_node_keys(snapshot: Optional[Dict[str, Any]]) -> Set[str]:
 
 
 def collect_node_report_markdown_by_key(store: Any, execution_id: str) -> Dict[str, Dict[str, str]]:
-    """Build node_key -> {title, markdown} from persisted node_ead_report rows."""
+    """Build node_key -> {title, markdown} from DB artifacts and canonical .FMR on disk."""
+    from .pfm_fmr_parse import load_canonical_fmr_reports, merge_fmr_reports_into_library
+
     out: Dict[str, Dict[str, str]] = {}
     try:
         rows = store.list_execution_pfm_artifacts(execution_id)
     except Exception:
-        return out
+        rows = []
     for art in rows or []:
         if str(art.get("artifact_type") or "") != "node_ead_report":
             continue
@@ -102,6 +170,7 @@ def collect_node_report_markdown_by_key(store: Any, execution_id: str) -> Dict[s
             "title": str(art.get("title") or nk),
             "markdown": md,
         }
+    merge_fmr_reports_into_library(out, load_canonical_fmr_reports(execution_id))
     return out
 
 
@@ -193,7 +262,10 @@ def _walk_tree(
 def validate_and_normalize_snapshot(
     payload: Dict[str, Any],
     *,
+    generation: int = 0,
+    revision: int = 0,
     previous_version: int = 0,
+    previous_revision: int = 0,
     report_carry_source_keys: Optional[Set[str]] = None,
     report_carry_library: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Tuple[Dict[str, Any], List[EadFmNodeRun], List[Dict[str, Any]]]:
@@ -216,17 +288,29 @@ def validate_and_normalize_snapshot(
     if not isinstance(payload, dict):
         raise SnapshotValidationError("payload must be an object", code="payload_not_object")
 
-    try:
-        version = int(payload.get("version") or 0)
-    except Exception:
-        raise SnapshotValidationError("version must be an integer", code="invalid_version")
-    if version <= 0:
-        raise SnapshotValidationError("version must be a positive integer", code="invalid_version")
-    if previous_version and version <= previous_version:
-        raise SnapshotValidationError(
-            f"version {version} must be strictly greater than current pfm_tree_version {previous_version}",
-            code="stale_version",
-        )
+    prev_rev = max(int(previous_revision or 0), int(previous_version or 0))
+    if generation > 0 and revision > 0:
+        gen, rev = int(generation), int(revision)
+        if prev_rev and rev <= prev_rev:
+            raise SnapshotValidationError(
+                f"revision {rev} must be strictly greater than current revision {prev_rev}",
+                code="stale_revision",
+            )
+    else:
+        try:
+            rev = int(payload.get("version") or 0)
+        except Exception:
+            raise SnapshotValidationError("version must be an integer", code="invalid_version")
+        if rev <= 0:
+            raise SnapshotValidationError("version must be a positive integer", code="invalid_version")
+        if prev_rev and rev <= prev_rev:
+            raise SnapshotValidationError(
+                f"version {rev} must be strictly greater than current pfm_tree_version {prev_rev}",
+                code="stale_version",
+            )
+        gen = int(payload.get("generation") or 0)
+        if gen <= 0:
+            gen = 0
 
     generated_at = payload.get("generated_at")
     try:
@@ -323,13 +407,18 @@ def validate_and_normalize_snapshot(
             )
         )
 
-    normalized = {
-        "version": version,
+    finalized = bool(payload.get("finalized")) if payload.get("finalized") is not None else False
+    normalized: Dict[str, Any] = {
+        "revision": rev,
+        "version": rev,
         "generated_at": generated_at_ms,
         "roots": roots_raw,
         "cross_cutting": cross_raw,
         "flat_nodes": flat,
+        "finalized": finalized,
     }
+    if gen > 0:
+        normalized["generation"] = gen
     return normalized, flat_runs, list(reports_by_key.values())
 
 

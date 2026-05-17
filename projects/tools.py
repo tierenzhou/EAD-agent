@@ -582,11 +582,17 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
         reports = build_and_persist_pfm_artifacts(execution)
         s.update_execution(execution_id, reports=reports)
         s.sync_execution_pfm_artifacts_from_state(execution_id)
+        from projects.pfm_materialize import ensure_committed_pfm_snapshot_after_artifact_delivery
+
+        snapshot_result = ensure_committed_pfm_snapshot_after_artifact_delivery(
+            s, execution_id, promote_template_canonical=False
+        )
         return json.dumps(
             {
                 "published": True,
                 "execution_id": execution_id,
                 "reports": [r.model_dump() for r in reports],
+                "pfm_snapshot": snapshot_result,
             }
         )
 
@@ -620,23 +626,36 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
         if not execution:
             return json.dumps({"error": f"Execution {execution_id} not found", "committed": False})
 
-        previous_version = 0
         prev_snap: Optional[dict] = None
+        previous_revision = 0
         try:
             from .pfm_tree import (
                 PFM_TREE_ARTIFACT_KEY,
                 collect_node_report_markdown_by_key,
                 committed_tree_node_keys,
+                snapshot_finalized,
+                snapshot_revision,
             )
 
             prev_art = s.get_execution_pfm_artifact(execution_id, PFM_TREE_ARTIFACT_KEY)
             if isinstance(prev_art, dict):
                 prev_snap = prev_art.get("snapshot")
                 if isinstance(prev_snap, dict):
-                    previous_version = int(prev_snap.get("version") or 0)
+                    previous_revision = snapshot_revision(prev_snap)
         except Exception:
-            previous_version = 0
+            previous_revision = 0
             prev_snap = None
+
+        if snapshot_finalized(prev_snap):
+            return json.dumps(
+                {
+                    "committed": False,
+                    "error": "PFM is finalized; no further revisions are allowed on this run.",
+                    "code": "pfm_finalized",
+                }
+            )
+
+        generation, revision = s.compute_next_pfm_versioning(execution, prev_snap)
 
         carry_source_keys = committed_tree_node_keys(prev_snap if isinstance(prev_snap, dict) else None)
         carry_library = (
@@ -646,7 +665,9 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
         try:
             snapshot, _flat_runs, report_payloads = validate_and_normalize_snapshot(
                 args,
-                previous_version=previous_version,
+                generation=generation,
+                revision=revision,
+                previous_revision=previous_revision,
                 report_carry_source_keys=carry_source_keys,
                 report_carry_library=carry_library,
             )
@@ -689,13 +710,15 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
             {
                 "committed": True,
                 "execution_id": execution_id,
-                "pfm_tree_version": int(snapshot.get("version") or 0),
+                "pfm_generation": int(snapshot.get("generation") or 0),
+                "pfm_revision": int(snapshot.get("revision") or snapshot.get("version") or 0),
+                "pfm_tree_version": int(snapshot.get("revision") or snapshot.get("version") or 0),
                 "generated_at": int(snapshot.get("generated_at") or 0),
                 "node_count": len(snapshot.get("flat_nodes") or []),
                 "report_count": len(report_payloads),
                 "incoming_report_count": len(incoming_keys),
                 "carried_forward_report_count": carried_report_count,
-                "previous_version": previous_version,
+                "previous_revision": previous_revision,
                 "reports_attached": list((result or {}).get("reports") or []) or None,
             }
         )
@@ -720,8 +743,8 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                 "version": {
                     "type": "integer",
                     "description": (
-                        "Monotonic snapshot version. Must be strictly greater than the "
-                        "previously committed version for this execution. Start at 1."
+                        "Deprecated — the gateway assigns template generation (e.g. 10) and "
+                        "within-run revision (Rev 1, 2, …). Omit this field."
                     ),
                 },
                 "generated_at": {
@@ -750,14 +773,14 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                 "node_reports": {
                     "type": "array",
                     "description": (
-                        "Markdown EAD reports keyed by node_key. On the **first** snapshot for this "
-                        "execution, include one entry with non-empty markdown for **every** node in "
-                        "the tree. On later snapshots (after at least one successful commit), you may "
-                        "send reports **only for new, renamed, or materially updated** nodes; the "
-                        "gateway automatically **carries forward** prior Markdown for unchanged "
-                        "node_key values from the last committed tree using saved node_ead_report "
-                        "artifacts. Always include full markdown for any brand-new node_key. "
-                        "Do not include node_key values that are not in roots/cross_cutting."
+                        "Detailed Markdown EAD reports keyed by node_key (standard sections: Node "
+                        "Summary, Features with test cases and evidence, then Explore and improve for "
+                        "future exploration). On the **first** snapshot for this execution, include "
+                        "one entry with non-empty markdown for **every** node in the tree. On later "
+                        "snapshots, send reports only for new or materially updated nodes; unchanged "
+                        "node_key values are carried forward automatically. Always include full "
+                        "markdown for brand-new node_key values. Do not include node_key values that "
+                        "are not in roots/cross_cutting."
                     ),
                     "items": {
                         "type": "object",
@@ -770,7 +793,7 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                     },
                 },
             },
-            "required": ["execution_id", "version", "roots", "node_reports"],
+            "required": ["execution_id", "roots", "node_reports"],
         },
         handler=_commit_pfm_snapshot,
         description="Commit the entire agent-authored PFM tree plus per-node EAD reports",

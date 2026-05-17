@@ -261,6 +261,8 @@ class ProjectExecute(BaseModel):
     pfm_canonical_evaluation_rationale: Optional[str] = None
     pfm_canonical_evaluation_at_ms: Optional[int] = None
     pfm_canonical_promotion_applied: Optional[bool] = None
+    # Per-template ordinal (1 = oldest by start_time). PFM version V equals run_number.
+    run_number: Optional[int] = None
 
 
 class ProjectsStoreFile(BaseModel):

@@ -14,6 +14,7 @@ commits).
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set
@@ -35,6 +36,12 @@ logger = logging.getLogger(__name__)
 
 _DEGENERATE_TITLES = frozenset(
     {"", "success", "failed", "no run", "verified", "pending", "unknown"},
+)
+
+from .pfm_fmr_parse import (
+    is_materialized_stub_markdown as _is_materialized_stub_markdown,
+    load_canonical_fmr_reports,
+    merge_fmr_reports_into_library,
 )
 
 
@@ -291,6 +298,108 @@ def _build_roots_payload_explicit_parents(nodes: List[EadFmNodeRun]) -> List[Dic
     return [_node_run_to_tree_dict(r, dict(children_map), visiting) for r in roots_unique]
 
 
+def _report_entry(node_key: str, title: str, markdown: str) -> Dict[str, str]:
+    return {
+        "node_key": node_key,
+        "title": (title or node_key)[:240],
+        "markdown": str(markdown or "").strip(),
+    }
+
+
+def _merge_report_into_library(
+    library: Dict[str, Dict[str, str]],
+    node_key: str,
+    title: str,
+    markdown: str,
+) -> None:
+    nk = str(node_key or "").strip()
+    md = str(markdown or "").strip()
+    if not nk or not md or _is_materialized_stub_markdown(md):
+        return
+    entry = _report_entry(nk, title, md)
+    prev = library.get(nk)
+    if not prev or _is_materialized_stub_markdown(prev.get("markdown", "")):
+        library[nk] = entry
+
+
+def _load_node_report_library(
+    store: Any,
+    execution: ProjectExecute,
+    *,
+    include_fallback_executions: bool = True,
+) -> Dict[str, Dict[str, str]]:
+    """
+    Rich node_ead_report artifacts for carry-forward during operator materialize/refresh.
+
+    Never prefer materialized stubs over agent-authored markdown. Optionally pulls from
+    inherited/baseline runs when this execution has no saved report for a node.
+    """
+    library: Dict[str, Dict[str, str]] = {}
+    execution_ids: List[str] = [str(execution.id or "").strip()]
+    if include_fallback_executions:
+        inh = str(execution.inherited_from_execution_id or "").strip()
+        if inh and inh not in execution_ids:
+            execution_ids.append(inh)
+        if hasattr(store, "resolve_pfm_baseline_execution_id"):
+            baseline = str(store.resolve_pfm_baseline_execution_id(execution) or "").strip()
+            if baseline and baseline not in execution_ids:
+                execution_ids.append(baseline)
+
+    if not hasattr(store, "list_execution_pfm_artifacts"):
+        return library
+
+    for eid in execution_ids:
+        if not eid:
+            continue
+        for art in store.list_execution_pfm_artifacts(eid) or []:
+            if not isinstance(art, dict):
+                continue
+            if str(art.get("artifact_type") or "").strip() != "node_ead_report":
+                continue
+            nk = str(art.get("node_key") or "").strip()
+            md = str(art.get("content") or art.get("markdown") or "").strip()
+            title = str(art.get("title") or nk)
+            _merge_report_into_library(library, nk, title, md)
+
+    _enrich_library_from_progress_log(execution, library)
+    merge_fmr_reports_into_library(
+        library,
+        load_canonical_fmr_reports(str(execution.id or "")),
+    )
+    return library
+
+
+def _enrich_library_from_progress_log(
+    execution: ProjectExecute,
+    library: Dict[str, Dict[str, str]],
+) -> None:
+    """Recover agent-authored reports still present in progress_log after stub overwrite."""
+    for entry in execution.progress_log or []:
+        text = str(getattr(entry, "text", None) or "").strip()
+        if not text or _is_materialized_stub_markdown(text):
+            continue
+        if not (
+            "[Node-Report-Reply-To:" in text
+            or (
+                "Node Summary:" in text
+                and "Features:" in text
+                and "Test Case TC-" in text
+            )
+        ):
+            continue
+        m = re.search(r"\[Node-Report-Reply-To:\s*([^\]]+)\]", text, re.IGNORECASE)
+        nk = m.group(1).strip() if m else ""
+        if not nk:
+            continue
+        title = nk
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if line.startswith("Purpose:"):
+                title = line.replace("Purpose:", "", 1).strip()[:120] or nk
+                break
+        _merge_report_into_library(library, nk, title, text)
+
+
 def _default_node_markdown(execution: ProjectExecute, node: EadFmNodeRun, node_key: str) -> str:
     title = (node.title or node_key).replace("\n", " ").strip()
     st = getattr(node.status, "value", None) if node.status is not None else node.status
@@ -317,11 +426,41 @@ def _collect_tree_keys(root: Dict[str, Any], out: Set[str]) -> None:
             _collect_tree_keys(ch, out)
 
 
+def _stamp_delivery_metadata(
+    snap: Dict[str, Any],
+    *,
+    execution_id: str,
+    source_fingerprint: str = "",
+    source_delivery_mtime_ms: int = 0,
+    source_delivery_files: Optional[List[Dict[str, Any]]] = None,
+    source_run_id: str = "",
+) -> Dict[str, Any]:
+    out = dict(snap)
+    eid = str(execution_id or "").strip()
+    if eid:
+        out["source_run_id"] = str(source_run_id or eid).strip() or eid
+    fp = str(source_fingerprint or "").strip()
+    if fp:
+        out["source_fingerprint"] = fp
+    if source_delivery_mtime_ms > 0:
+        out["source_delivery_mtime_ms"] = int(source_delivery_mtime_ms)
+    if source_delivery_files:
+        out["source_delivery_files"] = list(source_delivery_files)
+    return out
+
+
 def materialize_operator_pfm_snapshot(
     store: Any,
     execution_id: str,
     *,
     promote_template_canonical: bool = True,
+    generation: Optional[int] = None,
+    revision: Optional[int] = None,
+    source_fingerprint: str = "",
+    source_delivery_mtime_ms: int = 0,
+    source_delivery_files: Optional[List[Dict[str, Any]]] = None,
+    source_run_id: str = "",
+    delivery_refresh: bool = False,
 ) -> Dict[str, Any]:
     """
     Build and persist a committed PFM tree from existing run state.
@@ -334,11 +473,16 @@ def materialize_operator_pfm_snapshot(
         return {"ok": False, "code": "not_found", "message": "Execution not found"}
 
     is_active = execution.status in (ExecutionStatus.RUNNING, ExecutionStatus.PENDING)
-    if is_active and list(execution.results or []):
+    if (
+        not delivery_refresh
+        and is_active
+        and list(execution.results or [])
+        and store.has_committed_pfm_tree(execution_id)
+    ):
         return {
             "ok": False,
             "code": "use_agent_path",
-            "message": "Run is active with committed results[]; use the live agent snapshot path.",
+            "message": "Run is active with a committed tree; use commit_pfm_snapshot for updates.",
         }
 
     nodes = _collect_nodes_for_materialize(store, execution)
@@ -350,8 +494,10 @@ def materialize_operator_pfm_snapshot(
         }
 
     prev = store.get_committed_pfm_tree(execution_id)
-    prev_ver = int(prev.get("version") or 0) if isinstance(prev, dict) else 0
-    new_ver = prev_ver + 1 if prev_ver > 0 else 1
+    if generation is not None and revision is not None:
+        gen, rev = int(generation), int(revision)
+    else:
+        gen, rev = store.compute_next_pfm_versioning(execution, prev)
 
     if _all_parents_resolve(nodes):
         roots_payload = _build_roots_payload_explicit_parents(nodes)
@@ -369,8 +515,26 @@ def materialize_operator_pfm_snapshot(
         if k:
             keyed[k] = n
 
+    report_library = _load_node_report_library(store, execution)
+    carry_keys: Set[str] = set()
+    carry_lib: Dict[str, Dict[str, str]] = {}
     node_reports: List[Dict[str, Any]] = []
+
+    def _library_hit(tree_key: str) -> Optional[Dict[str, str]]:
+        if tree_key in report_library:
+            return report_library[tree_key]
+        tl = tree_key.lower()
+        for lib_key, entry in report_library.items():
+            if lib_key.lower() == tl:
+                return entry
+        return None
+
     for nk in sorted(tree_keys):
+        kept = _library_hit(nk)
+        if kept and not _is_materialized_stub_markdown(kept.get("markdown", "")):
+            carry_keys.add(nk)
+            carry_lib[nk] = dict(kept)
+            continue
         n = keyed.get(nk)
         if n:
             title = (n.title or nk)[:240]
@@ -383,9 +547,12 @@ def materialize_operator_pfm_snapshot(
             )
         node_reports.append({"node_key": nk, "title": title, "markdown": md})
 
+    from .pfm_tree import snapshot_revision
+
+    prev_rev = snapshot_revision(prev)
+
     payload: Dict[str, Any] = {
         "execution_id": execution_id,
-        "version": new_ver,
         "generated_at": int(time.time() * 1000),
         "roots": roots_payload,
         "cross_cutting": [],
@@ -395,11 +562,38 @@ def materialize_operator_pfm_snapshot(
     try:
         snap, _, reps = validate_and_normalize_snapshot(
             payload,
-            previous_version=prev_ver,
+            generation=gen,
+            revision=rev,
+            previous_revision=prev_rev,
+            report_carry_source_keys=carry_keys,
+            report_carry_library=carry_lib,
         )
     except SnapshotValidationError as exc:
         logger.warning("[pfm_materialize] validate failed for %s: %s", execution_id, exc)
         return {"ok": False, "code": getattr(exc, "code", "snapshot_invalid"), "message": str(exc)}
+
+    if not source_fingerprint or not source_delivery_files:
+        from .pfm_delivery import compute_delivery_stamp
+
+        stamp = compute_delivery_stamp(execution_id)
+        if not source_fingerprint:
+            source_fingerprint = str(stamp.get("fingerprint") or "")
+        if not source_delivery_mtime_ms:
+            source_delivery_mtime_ms = int(stamp.get("delivery_mtime_ms") or 0)
+        if not source_delivery_files:
+            source_delivery_files = list(stamp.get("files") or [])
+
+    snap = _stamp_delivery_metadata(
+        snap,
+        execution_id=execution_id,
+        source_fingerprint=source_fingerprint,
+        source_delivery_mtime_ms=source_delivery_mtime_ms,
+        source_delivery_files=source_delivery_files,
+        source_run_id=source_run_id,
+    )
+    from .pfm_delivery import apply_delivery_baseline_to_snapshot
+
+    snap = apply_delivery_baseline_to_snapshot(snap, execution_id)
 
     commit = store.replace_execution_pfm_tree(execution_id, snapshot=snap, node_reports=reps)
     if not commit.get("committed"):
@@ -427,3 +621,53 @@ def materialize_operator_pfm_snapshot(
         "promotion_note": promotion_error,
         **commit,
     }
+
+
+def ensure_committed_pfm_snapshot_after_artifact_delivery(
+    store: Any,
+    execution_id: str,
+    *,
+    promote_template_canonical: bool = False,
+) -> Dict[str, Any]:
+    """
+    When the agent publishes PFM files (``publish_pfm_artifacts``) but has not committed
+    a DB snapshot, materialize from run/artifact data so the operator UI can show this run's map.
+    """
+    if store.has_committed_pfm_tree(execution_id):
+        from .pfm_delivery import compute_delivery_stamp, delivery_changed
+        from .pfm_refresh import try_refresh_pfm_from_delivery
+
+        prev_raw = store._get_pfm_tree_snapshot_raw(execution_id)
+        stamp = compute_delivery_stamp(execution_id)
+        if delivery_changed(prev_raw, stamp):
+            return try_refresh_pfm_from_delivery(
+                store,
+                execution_id,
+                promote_template_canonical=promote_template_canonical,
+            )
+        snap = store.get_committed_pfm_tree(execution_id) or {}
+        return {
+            "ok": True,
+            "code": "already_committed",
+            "committed": True,
+            "pfm_tree_version": int(snap.get("version") or 0),
+            "skipped_materialize": True,
+        }
+    result = materialize_operator_pfm_snapshot(
+        store,
+        execution_id,
+        promote_template_canonical=promote_template_canonical,
+    )
+    if result.get("ok"):
+        logger.info(
+            "[pfm_materialize] Auto-materialized committed PFM tree for %s after artifact delivery (v%s).",
+            execution_id,
+            result.get("pfm_tree_version"),
+        )
+    else:
+        logger.warning(
+            "[pfm_materialize] Auto-materialize after artifact delivery failed for %s: %s",
+            execution_id,
+            result.get("message") or result.get("code"),
+        )
+    return result

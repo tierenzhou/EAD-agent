@@ -128,6 +128,11 @@ class ChatControlHandlers:
         logger.info("[chat] Sent user message to agent for session %s (deliver=%s)", session_key, deliver)
 
         if self._agent_pool is None:
+            db.append_message(
+                session_id=session_id,
+                role="user",
+                content=content,
+            )
             return _json_response(
                 {
                     "sent": True,
@@ -136,6 +141,23 @@ class ChatControlHandlers:
                     "note": "agent_pool not configured; message appended but agent not triggered",
                 }
             )
+
+        # Project runs need browser/report tools when the operator replies (e.g. login credentials).
+        enable_tools = str(session_key or "").startswith("eadproj-exec-")
+
+        db.append_message(
+            session_id=session_id,
+            role="user",
+            content=content,
+        )
+
+        if self._agent_pool.is_agent_active(session_key):
+            logger.info(
+                "[chat] Interrupting in-flight agent for session %s before delivering user message",
+                session_key,
+            )
+            self._agent_pool.interrupt_agent(session_key)
+            await asyncio.sleep(0.35)
 
         try:
             loop = asyncio.get_running_loop()
@@ -146,6 +168,7 @@ class ChatControlHandlers:
                         session_key=session_key,
                         user_message=content,
                         session_id=session_id,
+                        enable_tools=enable_tools,
                     ),
                 ),
                 timeout=45.0,
@@ -153,6 +176,13 @@ class ChatControlHandlers:
         except asyncio.TimeoutError:
             logger.warning("[chat] Agent timed out after 45s for session %s", session_key)
             self._agent_pool.interrupt_agent(session_key)
+            if enable_tools:
+                self._agent_pool.send_message_async(
+                    session_key=session_key,
+                    user_message=content,
+                    session_id=session_id,
+                    enable_tools=True,
+                )
             return _json_response(
                 {
                     "sent": True,

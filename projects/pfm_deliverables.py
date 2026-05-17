@@ -45,12 +45,33 @@ def generate_pfm_deliverables(store, execution_id: str) -> List[ProjectReportArt
     if not execution:
         return []
 
+    from .pfm_fmr_parse import ensure_node_reports_from_agent_delivery
+    from .pfm_node_report_content import (
+        backfill_node_reports_from_progress_log,
+        normalize_node_report_markdown,
+    )
+
+    if store.has_committed_pfm_tree(execution_id):
+        ensure_node_reports_from_agent_delivery(store, execution_id)
+    backfill_node_reports_from_progress_log(store, execution_id)
+
     template = store.get_template(execution.linked_template_id)
     nodes = resolve_pfm_nodes_for_mindmap(execution)
     artifacts = store.list_execution_pfm_artifacts(execution.id)
-    node_reports = [
-        artifact for artifact in artifacts if artifact.get("artifact_type") == "node_ead_report"
-    ]
+    node_reports: List[Dict[str, Any]] = []
+    for artifact in artifacts:
+        if str(artifact.get("artifact_type") or "") != "node_ead_report":
+            continue
+        node_key = str(artifact.get("node_key") or "").strip()
+        content = normalize_node_report_markdown(
+            str(artifact.get("content") or artifact.get("markdown") or "")
+        )
+        if not node_key or not content:
+            continue
+        row = dict(artifact)
+        row["node_key"] = node_key
+        row["content"] = content
+        node_reports.append(row)
 
     base_name = _export_base_name(template.name if template else execution.name, execution.id)
     out_dir = reports_root_dir() / execution.id
@@ -196,6 +217,8 @@ def _build_fmr_markdown(
     nodes: List[EadFmNodeRun],
     node_reports: List[Dict[str, Any]],
 ) -> str:
+    from .pfm_node_report_content import normalize_node_report_markdown
+
     reports_by_node_key = {
         str(report.get("node_key") or ""): report
         for report in node_reports
@@ -232,7 +255,9 @@ def _build_fmr_markdown(
             ]
         )
         report = reports_by_node_key.get(node.node_key)
-        content = str((report or {}).get("content") or "").strip()
+        content = normalize_node_report_markdown(
+            str((report or {}).get("content") or "")
+        )
         if content:
             lines.append(content)
         else:

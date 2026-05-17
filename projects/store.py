@@ -15,7 +15,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from .models import (
     EadFmNodeRun,
@@ -313,7 +313,10 @@ class ProjectStore:
             )
 
         self._execute_write(_write)
-        return execution
+        from .pfm_run_number import ensure_template_run_numbers
+
+        ensure_template_run_numbers(self, execution.linked_template_id)
+        return self.get_execution(execution.id) or execution
 
     def update_execution(self, execution_id: str, **fields) -> Optional[ProjectExecute]:
         execution = self.get_execution(execution_id)
@@ -373,6 +376,35 @@ class ProjectStore:
         if self.list_executions(template_id=template_id):
             self.rebuild_template_learning_from_latest_good_run(template_id)
         return True
+
+    def set_execution_continuous_learning(
+        self,
+        execution_id: str,
+        *,
+        enabled: bool,
+        reason: Optional[str] = None,
+    ) -> Optional[ProjectExecute]:
+        if not enabled:
+            exclusion = (
+                reason
+                or "Excluded from interactive learning — this run did not represent good knowledge gain"
+            ).strip()
+            return self.invalidate_execution_learning(execution_id, reason=exclusion)
+
+        execution = self.get_execution(execution_id)
+        if not execution:
+            return None
+
+        updated = self.update_execution(
+            execution_id,
+            contributes_to_learning=True,
+            valid_for_data_reporting_training=True,
+            learning_exclusion_reason=None,
+            invalid_for_data_reporting_training_reason=None,
+        )
+        if execution.linked_template_id:
+            self.rebuild_template_learning_from_latest_good_run(execution.linked_template_id)
+        return updated
 
     def invalidate_execution_learning(
         self, execution_id: str, reason: str = "Not valid for data reporting and training"
@@ -613,7 +645,9 @@ class ProjectStore:
     ) -> Optional[ProjectExecute]:
         """
         Pick a prior execution to copy PFM artifacts from.
-        Ordering: same as list_executions (created_at DESC — most recent first).
+
+        Prefer the latest completed run with PFM skill files (same source as post-login
+        skill inject). Fall back to latest completed eligible run, then any eligible run.
         """
         if explicit_source_id:
             sid = str(explicit_source_id).strip()
@@ -629,6 +663,24 @@ class ProjectStore:
             if not _eligible_for_pfm_run_inheritance(ex):
                 return None
             return ex
+
+        from .pfm_skills import resolve_template_learning_source_execution
+
+        learned = resolve_template_learning_source_execution(
+            self,
+            template_id,
+            exclude_execution_id=exclude_execution_id,
+        )
+        if learned:
+            return learned
+
+        for ex in self.list_executions(template_id=template_id):
+            if exclude_execution_id and ex.id == exclude_execution_id:
+                continue
+            if ex.status != ExecutionStatus.COMPLETED:
+                continue
+            if _eligible_for_pfm_run_inheritance(ex):
+                return ex
 
         for ex in self.list_executions(template_id=template_id):
             if exclude_execution_id and ex.id == exclude_execution_id:
@@ -664,12 +716,16 @@ class ProjectStore:
         artifacts = self.list_execution_pfm_artifacts(source_execution_id)
         inherited_reports: List[ProjectReportArtifact] = []
         inherited_results: Optional[List[EadFmNodeRun]] = None
-        inherited_notes: List[str] = []
+        inherited_report_count = 0
+
+        from .pfm_tree import NON_INHERITABLE_PFM_ARTIFACT_TYPES
 
         for artifact in artifacts:
             artifact_key = str(artifact.get("artifact_key") or "").strip()
             artifact_type = str(artifact.get("artifact_type") or "").strip()
             if not artifact_key:
+                continue
+            if artifact_type in NON_INHERITABLE_PFM_ARTIFACT_TYPES:
                 continue
 
             execution_payload = dict(artifact)
@@ -718,25 +774,23 @@ class ProjectStore:
                     )
 
             if artifact_type == "node_ead_report":
-                title = str(artifact.get("title") or artifact_key).strip()
-                excerpt = str(artifact.get("content") or artifact.get("excerpt") or "").strip()
-                inherited_notes.append(f"{title}: {excerpt[:500]}")
+                inherited_report_count += 1
 
         update_fields: Dict[str, Any] = {"inherited_from_execution_id": source_execution_id}
         if inherited_results:
             update_fields["results"] = inherited_results
         if inherited_reports:
             update_fields["reports"] = inherited_reports
-        if inherited_notes:
+        if inherited_results or inherited_reports or inherited_report_count:
+            mindmap_seeded = "mindmap seeded" if inherited_results else "no mindmap"
             progress_log = list(execution.progress_log or [])
             progress_log.append(
                 ProgressLogEntry(
                     ts=time.time(),
                     kind="system",
                     text=(
-                        "Inherited PFM node reports from prior execution "
-                        f"{source_execution_id}: "
-                        + " | ".join(inherited_notes[:5])
+                        f"PFM inherited from run {source_execution_id} "
+                        f"({inherited_report_count} node reports, {mindmap_seeded})."
                     ),
                 )
             )
@@ -767,12 +821,16 @@ class ProjectStore:
 
         inherited_reports = []
         inherited_results = None
-        inherited_notes = []
+        inherited_report_count = 0
+
+        from .pfm_tree import NON_INHERITABLE_PFM_ARTIFACT_TYPES
 
         for artifact in template_artifacts:
             artifact_key = str(artifact.get("artifact_key") or "").strip()
             artifact_type = str(artifact.get("artifact_type") or "").strip()
             if not artifact_key:
+                continue
+            if artifact_type in NON_INHERITABLE_PFM_ARTIFACT_TYPES:
                 continue
 
             source_execution_id = str(artifact.get("source_execution_id") or "").strip() or None
@@ -823,24 +881,23 @@ class ProjectStore:
                     )
 
             if artifact_type == "node_ead_report":
-                title = str(artifact.get("title") or artifact_key).strip()
-                excerpt = str(artifact.get("content") or artifact.get("excerpt") or "").strip()
-                inherited_notes.append(f"{title}: {excerpt[:500]}")
+                inherited_report_count += 1
 
         update_fields: Dict[str, Any] = {}
         if inherited_results:
             update_fields["results"] = inherited_results
         if inherited_reports:
             update_fields["reports"] = inherited_reports
-        if inherited_notes:
+        if inherited_results or inherited_reports or inherited_report_count:
+            mindmap_seeded = "mindmap seeded" if inherited_results else "no mindmap"
             progress_log = list(execution.progress_log or [])
             progress_log.append(
                 ProgressLogEntry(
                     ts=time.time(),
                     kind="system",
                     text=(
-                        "Inherited template PFM node EAD reports loaded for this run: "
-                        + " | ".join(inherited_notes[:5])
+                        f"PFM template context loaded ({inherited_report_count} node reports, "
+                        f"{mindmap_seeded})."
                     ),
                 )
             )
@@ -949,29 +1006,47 @@ class ProjectStore:
 
         flat_nodes = list(snapshot.get("flat_nodes") or [])
         flat_runs = flat_nodes_to_ead_runs(flat_nodes)
-        snapshot_payload = dict(snapshot)
-        version = int(snapshot_payload.get("version") or 0)
-        generated_at = int(snapshot_payload.get("generated_at") or int(time.time() * 1000))
-
-        artifact_payload = {
-            "artifact_key": PFM_TREE_ARTIFACT_KEY,
-            "artifact_type": PFM_TREE_ARTIFACT_TYPE,
-            "title": "PFM Tree Snapshot",
-            "filename": PFM_TREE_ARTIFACT_KEY,
-            "format": "json",
-            "snapshot": snapshot_payload,
-            "version": version,
-            "generated_at": generated_at,
-            "created_at": generated_at,
-            "node_count": len(flat_nodes),
-        }
-        self.upsert_execution_pfm_artifact(
-            execution.id,
-            PFM_TREE_ARTIFACT_KEY,
-            PFM_TREE_ARTIFACT_TYPE,
-            artifact_payload,
+        from .pfm_tree import (
+            snapshot_finalized,
+            snapshot_generation,
+            snapshot_has_committed_tree,
+            snapshot_revision,
         )
 
+        prev_snap = self.get_committed_pfm_tree(execution.id)
+        if snapshot_finalized(prev_snap):
+            return {
+                "committed": False,
+                "error": "pfm_finalized",
+                "code": "pfm_finalized",
+                "message": "PFM is finalized; no further revisions are allowed on this run.",
+            }
+
+        from .pfm_delivery import (
+            apply_delivery_baseline_to_snapshot,
+            compute_delivery_stamp,
+            restore_delivery_file_mtimes,
+        )
+
+        # Record agent on-disk delivery (filename + mtime) *before* we rewrite report/mindmap files.
+        pre_build_stamp = compute_delivery_stamp(execution.id)
+
+        snapshot_payload = self._enrich_snapshot_versioning(execution, dict(snapshot), prev_snap)
+        if not str(snapshot_payload.get("source_run_id") or "").strip():
+            snapshot_payload["source_run_id"] = execution.id
+        snapshot_payload = apply_delivery_baseline_to_snapshot(
+            snapshot_payload,
+            execution.id,
+            stamp=pre_build_stamp,
+        )
+        generation = snapshot_generation(snapshot_payload)
+        revision = snapshot_revision(snapshot_payload)
+        version = revision
+        generated_at = int(snapshot_payload.get("generated_at") or int(time.time() * 1000))
+
+        # Persist node reports before the tree artifact so the committed snapshot never
+        # appears without its EAD node reports on disk/DB.
+        committed_report_keys: List[str] = []
         for report in node_reports or []:
             if not isinstance(report, dict):
                 continue
@@ -985,6 +1060,34 @@ class ProjectStore:
                 title=str(report.get("title") or node_key),
                 content=markdown,
             )
+            committed_report_keys.append(node_key)
+
+        if committed_report_keys:
+            snapshot_payload["node_reports_committed_at"] = generated_at
+            snapshot_payload["node_reports_committed_keys"] = list(committed_report_keys)
+
+        artifact_payload = {
+            "artifact_key": PFM_TREE_ARTIFACT_KEY,
+            "artifact_type": PFM_TREE_ARTIFACT_TYPE,
+            "title": "PFM Tree Snapshot",
+            "filename": PFM_TREE_ARTIFACT_KEY,
+            "format": "json",
+            "snapshot": snapshot_payload,
+            "version": version,
+            "generation": generation,
+            "revision": revision,
+            "finalized": bool(snapshot_payload.get("finalized")),
+            "generated_at": generated_at,
+            "created_at": generated_at,
+            "node_count": len(flat_nodes),
+            "node_report_count": len(committed_report_keys),
+        }
+        self.upsert_execution_pfm_artifact(
+            execution.id,
+            PFM_TREE_ARTIFACT_KEY,
+            PFM_TREE_ARTIFACT_TYPE,
+            artifact_payload,
+        )
 
         updated = self.update_execution(execution.id, results=flat_runs)
         execution = updated or execution
@@ -1009,18 +1112,82 @@ class ProjectStore:
                 exc,
             )
 
+        # Our export rewrites pfm-report.md / mindmap; restore mtimes so Refresh is not fooled.
+        restore_delivery_file_mtimes(execution.id, pre_build_stamp)
+
+        # No agent files at commit time: record post-export delivery as baseline (once).
+        if not (pre_build_stamp.get("files") or []):
+            post_stamp = compute_delivery_stamp(execution.id)
+            if post_stamp.get("files"):
+                snapshot_payload = apply_delivery_baseline_to_snapshot(
+                    snapshot_payload,
+                    execution.id,
+                    stamp=post_stamp,
+                )
+                restore_delivery_file_mtimes(execution.id, post_stamp)
+                artifact_payload["snapshot"] = snapshot_payload
+                self.upsert_execution_pfm_artifact(
+                    execution.id,
+                    PFM_TREE_ARTIFACT_KEY,
+                    PFM_TREE_ARTIFACT_TYPE,
+                    artifact_payload,
+                )
+
         return {
             "committed": True,
             "execution_id": execution.id,
             "pfm_tree_version": version,
+            "pfm_generation": generation,
+            "pfm_revision": revision,
             "generated_at": generated_at,
             "node_count": len(flat_nodes),
             "report_count": len(node_reports or []),
             "reports": [r.model_dump() if hasattr(r, "model_dump") else dict(r) for r in report_artifacts],
         }
 
-    def get_committed_pfm_tree(self, execution_id: str) -> Optional[Dict[str, Any]]:
-        """Return the latest committed PFM tree snapshot, or None."""
+    def repair_pfm_snapshot_delivery_baseline(self, execution_id: str) -> bool:
+        """
+        Backfill per-file delivery baseline on snapshots that only have a legacy hash.
+        Returns True when the artifact was updated.
+        """
+        from .pfm_delivery import apply_delivery_baseline_to_snapshot
+        from .pfm_tree import PFM_TREE_ARTIFACT_KEY, PFM_TREE_ARTIFACT_TYPE, snapshot_has_committed_tree
+
+        raw = self._get_pfm_tree_snapshot_raw(execution_id)
+        if not snapshot_has_committed_tree(raw):
+            return False
+        from .pfm_delivery import snapshot_delivery_baseline_for_api
+
+        from .pfm_delivery import filter_canonical_delivery_files
+
+        raw_dict = dict(raw)
+        has_canonical = bool(
+            filter_canonical_delivery_files(snapshot_delivery_baseline_for_api(raw_dict).get("baseline_files"))
+        )
+        has_explicit = bool(
+            str(raw_dict.get("pfm_fmr_based_on_file") or "").strip()
+            and str(raw_dict.get("pfm_pfm_based_on_file") or "").strip()
+        )
+        if has_canonical and has_explicit:
+            return False
+        patched = apply_delivery_baseline_to_snapshot(raw_dict, execution_id)
+        if not filter_canonical_delivery_files(snapshot_delivery_baseline_for_api(patched).get("baseline_files")):
+            return False
+        artifact = self.get_execution_pfm_artifact(execution_id, PFM_TREE_ARTIFACT_KEY)
+        if not isinstance(artifact, dict):
+            return False
+        payload = dict(artifact)
+        payload["snapshot"] = patched
+        self.upsert_execution_pfm_artifact(
+            execution_id,
+            PFM_TREE_ARTIFACT_KEY,
+            PFM_TREE_ARTIFACT_TYPE,
+            payload,
+        )
+        return True
+
+    def _get_pfm_tree_snapshot_raw(self, execution_id: str) -> Optional[Dict[str, Any]]:
+        """Read committed tree artifact without lineage backfill (avoids recursion)."""
         from .pfm_tree import PFM_TREE_ARTIFACT_KEY
 
         artifact = self.get_execution_pfm_artifact(execution_id, PFM_TREE_ARTIFACT_KEY)
@@ -1029,18 +1196,90 @@ class ProjectStore:
         snap = artifact.get("snapshot")
         return snap if isinstance(snap, dict) else None
 
-    def has_committed_pfm_tree(self, execution_id: str) -> bool:
-        snap = self.get_committed_pfm_tree(execution_id)
+    def get_committed_pfm_tree(self, execution_id: str) -> Optional[Dict[str, Any]]:
+        """Return the latest committed PFM tree snapshot, with generation/revision backfill when missing."""
+        from .pfm_run_number import get_run_number
+        from .pfm_tree import snapshot_generation, snapshot_revision
+
+        snap = self._get_pfm_tree_snapshot_raw(execution_id)
         if not isinstance(snap, dict):
-            return False
-        ver = int(snap.get("version") or 0)
-        flat = snap.get("flat_nodes") or snap.get("flatNodes") or []
-        return ver > 0 and isinstance(flat, list) and len(flat) > 0
+            return None
+        ex = self.get_execution(execution_id)
+        if not ex:
+            return snap
+
+        out = dict(snap)
+        gen = get_run_number(self, ex)
+        rev = snapshot_revision(snap) or 1
+        out["generation"] = gen
+        out["revision"] = rev
+        out["version"] = rev
+        return out
+
+    def get_pfm_generation_for_run(self, ex: ProjectExecute) -> int:
+        """PFM V = run number on this template."""
+        from .pfm_run_number import get_run_number
+
+        return get_run_number(self, ex)
+
+    def has_committed_pfm_tree(self, execution_id: str) -> bool:
+        from .pfm_tree import snapshot_has_committed_tree
+
+        return snapshot_has_committed_tree(self._get_pfm_tree_snapshot_raw(execution_id))
+
+    def compute_next_pfm_versioning(
+        self, ex: ProjectExecute, prev_snap: Optional[Dict[str, Any]]
+    ) -> tuple[int, int]:
+        """
+        V = run number; Rev increments within the same run.
+        """
+        from .pfm_tree import snapshot_revision
+
+        gen = self.get_pfm_generation_for_run(ex)
+        prev_rev = snapshot_revision(prev_snap)
+        if prev_rev > 0:
+            return gen, prev_rev + 1
+        return gen, 1
+
+    def _enrich_snapshot_versioning(
+        self,
+        ex: ProjectExecute,
+        snapshot: Dict[str, Any],
+        prev_snap: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        from .pfm_tree import snapshot_generation, snapshot_revision
+
+        gen = snapshot_generation(snapshot)
+        rev = snapshot_revision(snapshot)
+        try:
+            ver_hint = int(snapshot.get("version") or 0)
+        except Exception:
+            ver_hint = 0
+        if ver_hint > rev:
+            rev = ver_hint
+        run_gen = self.get_pfm_generation_for_run(ex)
+        if gen > 0 and rev > 0:
+            snapshot["generation"] = run_gen
+            snapshot["revision"] = rev
+            snapshot["version"] = rev
+            return snapshot
+        next_gen, next_rev = self.compute_next_pfm_versioning(ex, prev_snap)
+        snapshot["generation"] = next_gen
+        snapshot["revision"] = next_rev
+        snapshot["version"] = next_rev
+        if "finalized" not in snapshot:
+            snapshot["finalized"] = False
+        return snapshot
 
     def resolve_pfm_baseline_execution_id(self, ex: ProjectExecute) -> Optional[str]:
         """Execution id to read committed PFM from when ``ex`` has no snapshot yet."""
         if self.has_committed_pfm_tree(ex.id):
             return None
+        from .pfm_run_number import prior_run_execution_id
+
+        chron_prior = prior_run_execution_id(self, ex)
+        if chron_prior and chron_prior != ex.id and self.has_committed_pfm_tree(chron_prior):
+            return chron_prior
         tmpl = self.get_template(ex.linked_template_id)
         canon = (tmpl.canonical_pfm_execution_id or "").strip() if tmpl else ""
         if canon and canon != ex.id and self.has_committed_pfm_tree(canon):
@@ -1049,6 +1288,107 @@ class ProjectStore:
         if inh and inh != ex.id and self.has_committed_pfm_tree(inh):
             return inh
         return None
+
+    def _resolve_lineage_baseline_tree_version(self, ex: ProjectExecute) -> tuple[str, int]:
+        """Find prior run with a committed tree for template lineage display (v9 → v10)."""
+        seen: Set[str] = set()
+        candidates: List[str] = []
+
+        def _add(candidate: Optional[str]) -> None:
+            cid = str(candidate or "").strip()
+            if not cid or cid == ex.id or cid in seen:
+                return
+            seen.add(cid)
+            candidates.append(cid)
+
+        _add(self.resolve_pfm_baseline_execution_id(ex))
+        tmpl = self.get_template(ex.linked_template_id)
+        if tmpl:
+            _add(tmpl.canonical_pfm_execution_id)
+        walk = ex
+        walk_seen: Set[str] = set()
+        for _ in range(8):
+            parent_id = str(getattr(walk, "inherited_from_execution_id", "") or "").strip()
+            if not parent_id or parent_id == ex.id:
+                break
+            _add(parent_id)
+            if parent_id in walk_seen:
+                break
+            walk_seen.add(parent_id)
+            parent = self.get_execution(parent_id)
+            if not parent:
+                break
+            walk = parent
+
+        from .pfm_tree import baseline_generation_from_snap, snapshot_has_committed_tree
+
+        best_id, best_gen = "", 0
+        for cid in candidates:
+            snap = self._get_pfm_tree_snapshot_raw(cid)
+            if not snapshot_has_committed_tree(snap):
+                continue
+            gen = baseline_generation_from_snap(snap)
+            if gen > best_gen:
+                best_id, best_gen = cid, gen
+        return best_id, best_gen
+
+    def resolve_pfm_lineage_context(self, ex: ProjectExecute) -> Dict[str, Any]:
+        """
+        Operator-facing PFM labels: V = run_number, Rev = within-run revision.
+        """
+        from .models import ExecutionStatus
+        from .pfm_run_number import get_run_number, prior_run_execution_id, prior_run_number
+        from .pfm_tree import snapshot_finalized, snapshot_revision
+
+        has_own = self.has_committed_pfm_tree(ex.id)
+        own_snap = self.get_committed_pfm_tree(ex.id) if has_own else None
+        finalized = snapshot_finalized(own_snap)
+
+        generation = get_run_number(self, ex)
+        baseline_ver = prior_run_number(self, ex)
+        baseline_id = prior_run_execution_id(self, ex) or ""
+        if not baseline_id:
+            baseline_id = self.resolve_pfm_baseline_execution_id(ex) or ""
+
+        tree_read_id = ex.id if has_own else (self.resolve_pfm_baseline_execution_id(ex) or baseline_id or "")
+
+        revision = snapshot_revision(own_snap) if has_own else 0
+
+        status = (
+            ex.status.value
+            if isinstance(ex.status, ExecutionStatus)
+            else str(ex.status or "")
+        ).lower()
+        hint = str(ex.executor_hint or "").lower()
+        finalizing_hint = any(
+            token in hint
+            for token in ("reporting", "finalizing", "deliverable", "ai finish")
+        )
+
+        if not has_own:
+            phase = "baseline_preview"
+        elif status in ("completed", "failed", "cancelled", "error"):
+            phase = "final"
+        elif status in ("running", "pending") and finalizing_hint:
+            phase = "finalizing"
+        elif status in ("running", "pending"):
+            phase = "evolving"
+        else:
+            phase = "final"
+
+        return {
+            "run_number": generation,
+            "pfm_baseline_execution_id": baseline_id or None,
+            "pfm_tree_read_execution_id": tree_read_id or None,
+            "pfm_baseline_tree_version": baseline_ver,
+            "pfm_generation_version": generation,
+            "pfm_revision": revision,
+            "pfm_lineage_version": generation,
+            "pfm_step_version": revision,
+            "pfm_finalized": finalized,
+            "pfm_has_committed_snapshot": has_own,
+            "pfm_snapshot_phase": phase,
+        }
 
     def promote_template_canonical_pfm(
         self,
@@ -1138,9 +1478,13 @@ class ProjectStore:
         title: str,
         content: str,
     ) -> Optional[Dict[str, Any]]:
+        from .pfm_node_report_content import normalize_node_report_markdown
+
         execution = self.get_execution(execution_id)
         if not execution:
             return None
+
+        content = normalize_node_report_markdown(content)
 
         safe_node_key = re.sub(
             r"[^a-z0-9]+",
@@ -1492,15 +1836,14 @@ class ProjectStore:
         }
 
     def _looks_like_node_report(self, text: str) -> bool:
+        from .pfm_node_report_content import is_valid_node_report_markdown
+
         normalized = str(text or "")
-        return (
-            "[Node-Report-Reply-To:" in normalized
-            or (
-                "Node Summary:" in normalized
-                and "Features:" in normalized
-                and "Test Case TC-" in normalized
-            )
-        )
+        if "[Node-Report-Reply-To:" in normalized:
+            from .pfm_node_report_content import normalize_node_report_markdown
+
+            return is_valid_node_report_markdown(normalize_node_report_markdown(normalized))
+        return is_valid_node_report_markdown(normalized)
 
     def _extract_node_report_title(self, text: str) -> str:
         for raw_line in str(text or "").splitlines():

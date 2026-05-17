@@ -16,7 +16,9 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Literal, Optional, Set
+
+DiscoveryNudgeKind = Literal["kickoff", "continue"]
 
 from .models import ExecutionStatus, ProgressLogEntry, ProjectExecute, StepResult
 from .store import ProjectStore
@@ -26,6 +28,7 @@ from .pfm_artifacts import (
     report_file_path,
     resolve_pfm_nodes_for_mindmap,
 )
+from .pfm_node_report_standard import PFM_NODE_REPORT_AGENT_INSTRUCTIONS
 from .pfm_deliverables import generate_pfm_deliverables
 
 
@@ -67,6 +70,14 @@ if _raw_pr_int:
     except ValueError:
         pass
 _STALL_INTERRUPT_S = 90.0
+_raw_discovery_nudge = (os.getenv("EAD_DISCOVERY_NUDGE_INTERVAL_S") or "").strip()
+if _raw_discovery_nudge:
+    try:
+        _DISCOVERY_NUDGE_INTERVAL_S = max(60.0, float(_raw_discovery_nudge))
+    except ValueError:
+        _DISCOVERY_NUDGE_INTERVAL_S = 180.0
+else:
+    _DISCOVERY_NUDGE_INTERVAL_S = 180.0
 # Optional timed regeneration of published PFM artifacts (accuracy still comes primarily
 # from progress-driven sync + terminal force-sync). 0/disabled by default — set e.g.
 # EAD_PFM_PERIODIC_SYNC_S=600 for 10-minute watchdog refreshes.
@@ -81,6 +92,12 @@ else:
 
 # Minimum seconds between UI-triggered PFM snapshot nudges for the same execution.
 _PFM_REFRESH_NUDGE_MIN_INTERVAL_S = 4.0
+_raw_pfm_snapshot_nudge = (os.getenv("EAD_PFM_SNAPSHOT_NUDGE_INTERVAL_S") or "300").strip()
+try:
+    _PFM_SNAPSHOT_NUDGE_INTERVAL_S = max(120.0, float(_raw_pfm_snapshot_nudge))
+except ValueError:
+    _PFM_SNAPSHOT_NUDGE_INTERVAL_S = 300.0
+_PFM_SNAPSHOT_NUDGE_MAX = 6
 
 _LOGIN_PHASE_PROMPT = (
     "LOGIN PHASE (MANDATORY, FIRST):\n"
@@ -93,8 +110,10 @@ _LOGIN_PHASE_PROMPT = (
     "to observe the UI state before deciding the next action.\n"
     "5) Communicate with the end user during login. Report what you see, what you need, why you are waiting, "
     "and what will happen next.\n"
-    "6) If credentials, OTP, captcha, or login/password information is missing or uncertain, stop guessing and ask "
-    "the end user for the needed information using report_running_step. Mark login_phase_status=pending.\n"
+    "6) If credentials, OTP, captcha, or login/password information is missing or uncertain, stop all browser/tool "
+    "actions immediately. Ask the end user clearly in this chat thread (a normal assistant reply) for username, "
+    "password, OTP, or captcha. Then call report_running_step with login_phase_status=pending and wait — do not "
+    "keep working until the user replies in chat.\n"
     "7) For each meaningful attempt, call report_running_step and include:\n"
     "   - title: 'Login PFM map (Interactive)'\n"
     "   - login_phase_status: pending | failed | success\n"
@@ -130,8 +149,9 @@ _LOGIN_PROGRESS_PROMPT = (
     "- Sign in only with an existing account. Never use sign-up/register/create-account/trial/onboarding flows.\n"
     "- State your login plan briefly before/while trying, then keep the user informed while you wait.\n"
     "- For each attempt, report what you saw, what you did, why, and next move in end-user friendly language.\n"
-    "- If username, password, OTP, captcha, environment, or account choice is missing, ask the user clearly and wait; do not guess.\n"
-    "- Use login_phase_status=pending while asking for user input or waiting for a login page/result.\n"
+    "- If username, password, OTP, captcha, environment, or account choice is missing, ask in chat first, then mark pending; do not guess or keep clicking.\n"
+    "- Use login_phase_status=pending while waiting for the user's chat reply with credentials.\n"
+    "- While pending, do not run browser tools or executor login kickoffs; wait for the operator's chat message.\n"
     "- Clearly report whether login succeeded and what evidence confirms success.\n"
     "- Capture screenshots frequently during meaningful UI transitions so end users can follow progress visually.\n"
     "- Required login screenshot sequence: (1) target URL/site identity, (2) login form or credential step, "
@@ -145,20 +165,18 @@ _LOGIN_PROGRESS_PROMPT = (
 _INITIALIZATION_REVIEW_PROMPT = (
     "INITIALIZATION STEP 2 (MANDATORY AFTER LOGIN, BEFORE DISCOVERY):\n"
     "1) Do not start new exploration yet.\n"
-    "2) Call tool **read_ead_execution** once for this Execution ID and reconcile counters, artifact links, "
-    "and persisted `results[]` versus any system baseline tagged **[PFM-PHASE1-CANONICAL-BASELINE:v1]** in this transcript.\n"
-    "3) Read and summarize the inherited/template PFM context (including every **Persisted Node EAD report** "
-    "listed in that canonical baseline).\n"
-    "4) Summarize the accumulated PFM mindmap: domains, nodes, functional areas, gaps, "
-    "**and explicitly confirm coverage of each named EAD node report**.\n"
-    "5) Explain what you will verify or improve during this run's assigned duration.\n"
+    "2) If **[PFM-POST-LOGIN-SKILLS:v1]** was injected, use the Read tool on both PFM SKILL.md files "
+    "(kloud-pfm-map and kloud-pfm-reports) before reconciling on the live app.\n"
+    "3) Call tool **read_ead_execution** once for this Execution ID and reconcile counters, artifact links, "
+    "and persisted `results[]` against what you read from skills (or the short inherited snapshot if no skills).\n"
+    "4) Treat inherited map/reports as **hypothesis to verify on the live app**, not as final output for this run.\n"
+    "5) Summarize domains, nodes, functional areas, gaps, and what you will verify during this run's duration.\n"
     "6) Call report_running_step with:\n"
     "   - title: 'PFM inheritance review (Initialization)'\n"
     "   - initialization_review_status: success\n"
     "   - ready_to_explore: true\n"
     "   - observation, finding, reasoning, decision, next_direction\n"
-    "7) In that report, show the previous baseline as a concise mindmap-style outline before your plan "
-    "(include sub-areas inherited from hierarchy / parent nodes where known).\n"
+    "7) In that report, show the prior baseline as a concise mindmap-style outline before your plan.\n"
     "8) After this checkpoint is recorded, discovery may begin and the run timer progresses.\n"
     + _ACTIVITY_MESSAGE_PROMPT
 )
@@ -191,11 +209,16 @@ _PFM_STRUCTURE_PROMPT = (
 
 _PFM_SNAPSHOT_COMMIT_PROMPT = (
     "PFM SNAPSHOT COMMIT (single source of truth for the mindmap, persistence, and inheritance):\n"
-    "- Call the tool **commit_pfm_snapshot** roughly every 2 to 5 minutes during exploration and once "
+    "- Call the tool **commit_pfm_snapshot** about every **5 minutes** during exploration and once "
     "as the final step before this run ends. Each commit must reflect the **current full tree** "
-    "(roots + cross_cutting + hierarchy) even when you only revise a subset of EAD text.\n"
-    "- Required arguments: execution_id, version (monotonically increasing integer starting at 1, "
-    "and strictly greater than any previously committed version), roots[] (top-level PFM nodes), "
+    "(roots + cross_cutting + hierarchy) even when you only revise a subset of EAD text. "
+    "The operator UI labels each commit as **PFM v(N+1) (Rev 1)**, **PFM v(N+1) (Rev 2)**, … — "
+    "revision number only, never a total count. When the run PFM is finalized, the label becomes "
+    "**PFM v(N+1)** with no further revisions. Relative to the "
+    "inherited baseline tree version N from the prior run.\n"
+    "- Required arguments: execution_id, version (monotonically increasing integer starting at 1 "
+    "for this execution, and strictly greater than any previously committed version for this run), "
+    "roots[] (top-level PFM nodes), "
     "optional cross_cutting[] (separate non-product buckets), and node_reports[] (Markdown EAD "
     "reports keyed by node_key).\n"
     "- Tree shape rules:\n"
@@ -215,6 +238,9 @@ _PFM_SNAPSHOT_COMMIT_PROMPT = (
     "from disk so you do not regenerate huge mindmaps every interval.\n"
     "  * Always send full markdown for any **brand-new** node_key (no carry-forward exists yet).\n"
     "  * Empty markdown in an included entry is rejected.\n"
+    "- node_reports[] content standard (required for every included report):\n"
+    + "\n".join("  " + line for line in PFM_NODE_REPORT_AGENT_INSTRUCTIONS.splitlines())
+    + "\n"
     "- The committed snapshot replaces the prior tree atomically; later commits overwrite earlier ones. "
     "If validation fails the previous committed tree stays in place untouched.\n"
     "- This commit is what end users see in the UI mindmap and what future runs inherit. Do not "
@@ -385,13 +411,19 @@ class ProjectExecutor:
         self._success_streak: Dict[str, int] = {}
         self._login_phase_prompt_sent: Dict[str, bool] = {}
         self._initialization_review_prompt_sent: Dict[str, bool] = {}
-        self._discovery_phase_prompt_sent: Dict[str, bool] = {}
+        self._discovery_kickoff_sent: Dict[str, bool] = {}
+        self._last_discovery_nudge_ts: Dict[str, float] = {}
+        self._post_login_skills_injected: Set[str] = set()
+        self._post_login_baseline_injected: Set[str] = set()
         self._last_progress_seq_seen: Dict[str, int] = {}
         self._last_progress_activity_ts: Dict[str, float] = {}
         self._last_pfm_periodic_ts: Dict[str, float] = {}
         self._pfm_refresh_nudge_ts: Dict[str, float] = {}
         # Operator clicked Refresh while run_conversation was in-flight — flush on next idle tick.
         self._pending_pfm_snapshot_refresh: Set[str] = set()
+        self._post_init_snapshot_nudged: Set[str] = set()
+        self._pfm_snapshot_nudge_count: Dict[str, int] = {}
+        self._last_pfm_snapshot_periodic_ts: Dict[str, float] = {}
 
     def request_pfm_snapshot_refresh(self, execution_id: str) -> Dict[str, object]:
         """Ask the session agent (async) to call commit_pfm_snapshot for the mindmap UI."""
@@ -466,6 +498,33 @@ class ProjectExecutor:
             run_id,
         )
         return {"ok": True, "code": "queued", "run_id": run_id}
+
+    def _maybe_periodic_pfm_snapshot_nudge(
+        self, execution_id: str, execution: ProjectExecute
+    ) -> None:
+        if execution.status != ExecutionStatus.RUNNING:
+            return
+        if self._store.has_committed_pfm_tree(execution_id):
+            return
+        count = int(self._pfm_snapshot_nudge_count.get(execution_id, 0))
+        if count >= _PFM_SNAPSHOT_NUDGE_MAX:
+            return
+        now = time.time()
+        last = self._last_pfm_snapshot_periodic_ts.get(execution_id, 0.0)
+        if now - last < _PFM_SNAPSHOT_NUDGE_INTERVAL_S:
+            return
+        self._last_pfm_snapshot_periodic_ts[execution_id] = now
+        nudge = self.request_pfm_snapshot_refresh(execution_id)
+        code = str(nudge.get("code") or "")
+        if code in ("queued", "queued_deferred", "throttled"):
+            self._pfm_snapshot_nudge_count[execution_id] = count + 1
+            logger.info(
+                "[executor] Periodic PFM snapshot nudge for %s (%s/%s): %s",
+                execution_id,
+                self._pfm_snapshot_nudge_count[execution_id],
+                _PFM_SNAPSHOT_NUDGE_MAX,
+                code,
+            )
 
     def _completed_refresh_has_no_changes(
         self,
@@ -596,7 +655,8 @@ class ProjectExecutor:
         self._success_streak[execution_id] = 0
         self._login_phase_prompt_sent[execution_id] = False
         self._initialization_review_prompt_sent[execution_id] = False
-        self._discovery_phase_prompt_sent[execution_id] = False
+        self._discovery_kickoff_sent[execution_id] = False
+        self._last_discovery_nudge_ts[execution_id] = 0.0
         self._last_progress_seq_seen[execution_id] = int(execution.progress_log_seq or 0)
         self._last_progress_activity_ts[execution_id] = time.time()
 
@@ -640,7 +700,8 @@ class ProjectExecutor:
             self._success_streak.setdefault(execution_id, 0)
             self._login_phase_prompt_sent.setdefault(execution_id, False)
             self._initialization_review_prompt_sent.setdefault(execution_id, False)
-            self._discovery_phase_prompt_sent.setdefault(execution_id, False)
+            self._discovery_kickoff_sent.setdefault(execution_id, False)
+            self._last_discovery_nudge_ts.setdefault(execution_id, 0.0)
             self._last_pfm_periodic_ts.setdefault(execution_id, time.time())
             task = asyncio.create_task(self._monitor_loop(execution_id))
             self._running[execution_id] = task
@@ -711,7 +772,31 @@ class ProjectExecutor:
                         await self._sync_pfm_artifacts(execution_id, force=True)
                         self._last_pfm_periodic_ts[execution_id] = now_ts
 
+                    exec_after_sync = self._store.get_execution(execution_id) or execution
+                    if (
+                        exec_after_sync.status == ExecutionStatus.RUNNING
+                        and self._is_login_successful(exec_after_sync)
+                        and self._is_initialization_review_complete(exec_after_sync)
+                        and not self._store.has_committed_pfm_tree(execution_id)
+                    ):
+                        if execution_id not in self._post_init_snapshot_nudged:
+                            self._post_init_snapshot_nudged.add(execution_id)
+                            nudge = self.request_pfm_snapshot_refresh(execution_id)
+                            self._pfm_snapshot_nudge_count[execution_id] = 1
+                            logger.info(
+                                "[executor] Post-init PFM snapshot nudge for %s: %s",
+                                execution_id,
+                                nudge.get("code"),
+                            )
+                        else:
+                            self._maybe_periodic_pfm_snapshot_nudge(execution_id, exec_after_sync)
+
                     latest = self._store.get_execution(execution_id) or execution
+                    if self._login_phase_status(latest) == "pending":
+                        self._store.update_execution(
+                            execution_id,
+                            executor_hint="Waiting for your login details in chat",
+                        )
                     current_seq = int(latest.progress_log_seq or 0)
                     prev_seq = int(self._last_progress_seq_seen.get(execution_id, 0))
                     if current_seq > prev_seq:
@@ -731,7 +816,7 @@ class ProjectExecutor:
                             )
                             self._pool.interrupt_agent(session_key)
                             if self._is_initialization_review_complete(latest):
-                                self._discovery_phase_prompt_sent[execution_id] = False
+                                self._last_discovery_nudge_ts[execution_id] = 0.0
                             elif self._is_login_successful(latest):
                                 self._initialization_review_prompt_sent[execution_id] = False
                             else:
@@ -787,7 +872,8 @@ class ProjectExecutor:
         self._success_streak.pop(execution_id, None)
         self._login_phase_prompt_sent.pop(execution_id, None)
         self._initialization_review_prompt_sent.pop(execution_id, None)
-        self._discovery_phase_prompt_sent.pop(execution_id, None)
+        self._discovery_kickoff_sent.pop(execution_id, None)
+        self._last_discovery_nudge_ts.pop(execution_id, None)
         self._last_progress_seq_seen.pop(execution_id, None)
         self._last_progress_activity_ts.pop(execution_id, None)
         self._last_pfm_periodic_ts.pop(execution_id, None)
@@ -1163,6 +1249,199 @@ class ProjectExecutor:
                 break
         return after_marker
 
+    def _inject_post_login_context_once(self, execution: ProjectExecute) -> None:
+        """Inject PFM skills after login; minimal baseline only when skills are unavailable."""
+        self._inject_post_login_skills_once(execution)
+        template_id = str(execution.linked_template_id or "").strip()
+        if not template_id:
+            return
+        try:
+            from projects.pfm_skills import resolve_template_skills_for_injection
+
+            if resolve_template_skills_for_injection(self._store, template_id):
+                return
+        except Exception as exc:
+            logger.warning(
+                "[executor] Skill resolution failed for template %s: %s",
+                template_id,
+                exc,
+            )
+        self._inject_phase1_baseline_once(execution)
+
+    def _inject_post_login_skills_once(self, execution: ProjectExecute) -> None:
+        """Append template PFM skill paths to the run session once after login succeeds."""
+        eid = str(execution.id or "").strip()
+        session_key = str(execution.run_session_key or "").strip()
+        template_id = str(execution.linked_template_id or "").strip()
+        if not eid or not session_key or not template_id:
+            return
+        if eid in self._post_login_skills_injected:
+            return
+        try:
+            from projects.pfm_skills import build_post_login_skills_inject_message
+
+            body = build_post_login_skills_inject_message(self._store, template_id)
+            if not body:
+                return
+            from hermes_state import SessionDB
+
+            db = SessionDB()
+            session_id = db.resolve_session_by_title(session_key)
+            if not session_id:
+                return
+            db.append_message(session_id=session_id, role="system", content=body)
+            self._post_login_skills_injected.add(eid)
+            logger.info(
+                "[executor] Post-login PFM skills injected for execution %s (template %s)",
+                eid,
+                template_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[executor] Post-login PFM skills inject failed for %s: %s",
+                eid,
+                exc,
+            )
+
+    def _inject_phase1_baseline_once(self, execution: ProjectExecute) -> None:
+        """Append canonical PFM baseline snapshot once after login (not during login phase)."""
+        eid = str(execution.id or "").strip()
+        session_key = str(execution.run_session_key or "").strip()
+        if not eid or not session_key:
+            return
+        if eid in self._post_login_baseline_injected:
+            return
+        try:
+            from projects.api import _build_phase1_canonical_baseline_message
+            from hermes_state import SessionDB
+
+            body = _build_phase1_canonical_baseline_message(self._store, execution)
+            if not body:
+                return
+            db = SessionDB()
+            session_id = db.resolve_session_by_title(session_key)
+            if not session_id:
+                return
+            db.append_message(session_id=session_id, role="system", content=body)
+            self._post_login_baseline_injected.add(eid)
+            logger.info(
+                "[executor] Post-login Phase-1 baseline injected for execution %s",
+                eid,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[executor] Post-login Phase-1 baseline inject failed for %s: %s",
+                eid,
+                exc,
+            )
+
+    def _is_within_exploration_budget(self, execution: ProjectExecute) -> bool:
+        """True while the post-login exploration timer has not exceeded time_budget_minutes."""
+        if not execution.start_time:
+            return False
+        if not execution.time_budget_minutes or execution.time_budget_minutes <= 0:
+            return True
+        elapsed_ms = int(time.time() * 1000) - execution.start_time
+        budget_ms = int(execution.time_budget_minutes * 60 * 1000)
+        return elapsed_ms < budget_ms
+
+    def _format_budget_remaining(self, execution: ProjectExecute) -> str:
+        if not execution.start_time:
+            return "budget not started (awaiting login)"
+        if not execution.time_budget_minutes or execution.time_budget_minutes <= 0:
+            return "no time limit configured"
+        elapsed_ms = max(0, int(time.time() * 1000) - execution.start_time)
+        budget_ms = int(execution.time_budget_minutes * 60 * 1000)
+        remaining_ms = max(0, budget_ms - elapsed_ms)
+        return f"{self._format_mmss(remaining_ms)} remaining of {self._format_mmss(budget_ms)}"
+
+    def _discovery_nudge_kind(
+        self, execution_id: str, execution: ProjectExecute
+    ) -> Optional[DiscoveryNudgeKind]:
+        if execution.status != ExecutionStatus.RUNNING:
+            return None
+        if not self._is_login_successful(execution):
+            return None
+        if not self._is_initialization_review_complete(execution):
+            return None
+        if not self._is_within_exploration_budget(execution):
+            return None
+        if not self._discovery_kickoff_sent.get(execution_id, False):
+            return "kickoff"
+        last_nudge = self._last_discovery_nudge_ts.get(execution_id, 0.0)
+        if time.time() - last_nudge >= _DISCOVERY_NUDGE_INTERVAL_S:
+            return "continue"
+        return None
+
+    def _build_discovery_kickoff_message(
+        self, execution: ProjectExecute, project_boundary: str, pace_hint: str
+    ) -> str:
+        from projects.pfm_skills import (
+            PFM_POST_LOGIN_SKILLS_MARKER,
+            resolve_template_skills_for_injection,
+        )
+
+        phase2 = self._extract_phase_instruction(execution.ai_prompt or "", 2)
+        phase2_focus = ""
+        if phase2:
+            first_line = phase2.strip().split("\n", 1)[0].strip()
+            phase2_focus = first_line[:500] if first_line else ""
+        has_skills = bool(
+            resolve_template_skills_for_injection(
+                self._store, execution.linked_template_id or ""
+            )
+        )
+        target_hint = (execution.target_url or "").strip()
+        remaining = self._format_budget_remaining(execution)
+        parts = [
+            project_boundary,
+            "",
+            "Login confirmed. Initialization complete. Start PFM discovery on this Execution ID.",
+            f"You have {remaining} in the active exploration budget.",
+            "Skills and inherited map/reports are hypothesis only — navigate the live app and collect new evidence.",
+            "Do not treat this run as complete until the budget ends or the operator stops you.",
+        ]
+        if has_skills:
+            parts.append(
+                f"PFM skills were injected above ({PFM_POST_LOGIN_SKILLS_MARKER}) — "
+                "use that context; verify on the live app."
+            )
+            parts.append(
+                "Before claiming you are caught up, perform at least one live report_running_step "
+                "with a fresh screenshot from the target URL."
+            )
+        parts.extend(
+            [
+                "Report actions via report_running_step; include structured pfm_node when updating nodes.",
+                _PFM_SNAPSHOT_COMMIT_PROMPT,
+            ]
+        )
+        if target_hint:
+            parts.append(f"\nTarget URL:\n{target_hint}")
+        if phase2_focus:
+            parts.append(f"\nPhase II focus: {phase2_focus}")
+        else:
+            parts.append("\nPhase II: PFM node identification, DFS navigation, and tree construction.")
+        if not has_skills:
+            parts.append(_PFM_STRUCTURE_PROMPT)
+        if pace_hint:
+            parts.append(pace_hint)
+        return "\n".join(parts)
+
+    def _build_discovery_continue_message(
+        self, execution: ProjectExecute, _project_boundary: str, pace_hint: str
+    ) -> str:
+        remaining = self._format_budget_remaining(execution)
+        parts = [
+            f"Continue Phase II DFS exploration — {remaining}.",
+            "Pick an unverified or shallow PFM node, navigate on the live app,",
+            "report_running_step with evidence, and commit_pfm_snapshot when the tree changes.",
+            "Do not stop early because inherited skills or prior maps already describe the product.",
+        ]
+        if pace_hint:
+            parts.append(pace_hint)
+        return "\n".join(parts)
+
     async def _auto_continue(self, execution_id: str) -> None:
         if execution_id in self._cancelled:
             return
@@ -1204,12 +1483,14 @@ class ProjectExecutor:
         login_status = self._login_phase_status(execution)
         login_success = login_status == "success"
         review_complete = self._is_initialization_review_complete(execution)
+        discovery_nudge = self._discovery_nudge_kind(execution_id, execution)
         should_send = (
             (
                 not login_success
+                and login_status != "pending"
                 and (
                     not self._login_phase_prompt_sent.get(execution_id, False)
-                    or login_status in ("missing", "pending")
+                    or login_status == "failed"
                 )
             )
             or (
@@ -1217,11 +1498,7 @@ class ProjectExecutor:
                 and not review_complete
                 and not self._initialization_review_prompt_sent.get(execution_id, False)
             )
-            or (
-                login_success
-                and review_complete
-                and not self._discovery_phase_prompt_sent.get(execution_id, False)
-            )
+            or discovery_nudge is not None
         )
         if not should_send:
             return
@@ -1235,10 +1512,12 @@ class ProjectExecutor:
         self._auto_continue_counts[execution_id] = count + 1
         self._last_continue_ts[execution_id] = time.time()
 
+        phase_label = discovery_nudge or ("login" if not login_success else "init")
         logger.info(
-            "[executor] Auto-continue #%d for %s (cooldown=%.1fs)",
+            "[executor] Auto-continue #%d for %s phase=%s (cooldown=%.1fs)",
             count + 1,
             execution_id,
+            phase_label,
             current_cooldown,
         )
 
@@ -1267,6 +1546,7 @@ class ProjectExecutor:
             )
         elif not review_complete:
             self._initialization_review_prompt_sent[execution_id] = True
+            self._inject_post_login_context_once(execution)
             target_hint = (execution.target_url or "").strip()
             inherited_context = self._extract_template_learning_context(execution.ai_prompt or "")
             time_budget = (
@@ -1289,24 +1569,19 @@ class ProjectExecutor:
                 + f"\n\nAssigned active exploration duration after initialization: {time_budget}."
                 + pace_hint
             )
-        else:
-            self._discovery_phase_prompt_sent[execution_id] = True
-            phase2 = self._extract_phase_instruction(execution.ai_prompt or "", 2)
-            target_hint = (execution.target_url or "").strip()
-            user_message = (
-                project_boundary
-                + "\n\n"
-                "Login confirmed. Start PFM discovery phase now. "
-                "Report real actions/reasoning via report_running_step; include structured pfm_node; "
-                "and call commit_pfm_snapshot roughly every 5 minutes to publish the full tree."
-                + "\n"
-                + _PFM_STRUCTURE_PROMPT
-                + "\n"
-                + _PFM_SNAPSHOT_COMMIT_PROMPT
-                + (f"\n\nTarget URL:\n{target_hint}" if target_hint else "")
-                + (f"\n\nPhase II assignment:\n{phase2}" if phase2 else "")
-                + pace_hint
+        elif discovery_nudge == "kickoff":
+            self._discovery_kickoff_sent[execution_id] = True
+            self._last_discovery_nudge_ts[execution_id] = time.time()
+            user_message = self._build_discovery_kickoff_message(
+                execution, project_boundary, pace_hint
             )
+        elif discovery_nudge == "continue":
+            self._last_discovery_nudge_ts[execution_id] = time.time()
+            user_message = self._build_discovery_continue_message(
+                execution, project_boundary, pace_hint
+            )
+        else:
+            return
 
         self._pool.send_message_async(
             session_key=session_key,
@@ -1316,24 +1591,9 @@ class ProjectExecutor:
         )
 
     def _project_boundary_prompt(self, execution: ProjectExecute) -> str:
-        target = (execution.target_url or "").strip() or "the configured target URL"
-        template_id = (execution.linked_template_id or "").strip()
-        run_name = (execution.name or execution.id).strip()
-        return "\n".join(
-            [
-                "HARD PROJECT TEMPLATE BOUNDARY:",
-                f"- Execution ID: {execution.id}.",
-                f"- Template ID: {template_id}.",
-                f"- Run name: {run_name}.",
-                f"- Target URL: {target}.",
-                "- This project template is independent from every other template.",
-                "- Do not use global memory, memories from other templates, previous chat sessions, or facts from any different target as evidence.",
-                "- If you remember SWAdmin, employee portal, team portal, user manager, system setting, or any other prior project, ignore it unless it is discovered again from this exact target during this run.",
-                "- Start from the Target URL above. Do not navigate to a remembered URL or subdomain unless the Target URL itself redirects there and you report that redirect as live evidence.",
-                "- PFM nodes, EAD node reports, screenshots, and training data must describe only this execution and this template.",
-                "- Every project tool call must use the Execution ID above.",
-            ]
-        )
+        from projects.api import _execution_scope_message
+
+        return _execution_scope_message(execution)
 
     async def _check_budget(self, execution_id: str) -> None:
         execution = self._store.get_execution(execution_id)
@@ -1473,6 +1733,14 @@ class ProjectExecutor:
                 # Ignore executor-generated progress messages to avoid echo loops in future summaries.
                 if content.strip().startswith(_PROGRESS_MESSAGE_PREFIX):
                     continue
+                try:
+                    from projects.api import EAD_RUN_ACK_MARKER
+
+                    if content.strip().startswith(EAD_RUN_ACK_MARKER):
+                        continue
+                except ImportError:
+                    if content.strip().startswith("[EAD-RUN-ACK:v1]"):
+                        continue
                 image_ref = _extract_image_reference_from_payload(content)
                 image_url = None
                 thumbnail_url = None
@@ -1532,8 +1800,7 @@ class ProjectExecutor:
                 if refreshed:
                     execution = refreshed
 
-        reports = build_and_persist_pfm_artifacts(execution)
-        self._store.update_execution(execution_id, reports=reports)
+        # Sync DB artifacts only — do not rewrite agent delivery files on disk (preserves mtime stamps).
         self._store.sync_execution_pfm_artifacts_from_state(execution_id)
         self._last_pfm_sync_seq[execution_id] = seq
 
@@ -1545,13 +1812,32 @@ class ProjectExecutor:
         try:
             committed_tree = self._store.get_committed_pfm_tree(execution_id)
             if not committed_tree:
-                logger.warning(
-                    "[executor] Execution %s completed without a committed PFM tree snapshot; "
-                    "mindmap will show 'Awaiting first commit'. Ensure the agent calls "
-                    "commit_pfm_snapshot during/before exploration ends.",
-                    execution_id,
+                from projects.pfm_materialize import materialize_operator_pfm_snapshot
+
+                materialized = materialize_operator_pfm_snapshot(
+                    self._store, execution_id
                 )
-            else:
+                if materialized.get("ok"):
+                    committed_tree = self._store.get_committed_pfm_tree(execution_id)
+                    logger.info(
+                        "[executor] Materialized PFM tree on finalize for %s (v%s).",
+                        execution_id,
+                        (committed_tree or {}).get("version"),
+                    )
+                elif materialized.get("code") != "no_nodes":
+                    logger.warning(
+                        "[executor] Execution %s completed without a committed PFM tree; "
+                        "materialize fallback failed: %s",
+                        execution_id,
+                        materialized.get("message") or materialized.get("code"),
+                    )
+                else:
+                    logger.warning(
+                        "[executor] Execution %s completed without a committed PFM tree "
+                        "and no PFM nodes to materialize.",
+                        execution_id,
+                    )
+            if committed_tree:
                 logger.info(
                     "[executor] Finalize: execution %s has pfm_tree v%s with %s nodes.",
                     execution_id,
@@ -1564,6 +1850,12 @@ class ProjectExecutor:
             )
 
         try:
+            from .pfm_fmr_parse import ensure_node_reports_from_agent_delivery
+            from .pfm_node_report_content import backfill_node_reports_from_progress_log
+
+            if self._store.has_committed_pfm_tree(execution_id):
+                ensure_node_reports_from_agent_delivery(self._store, execution_id)
+            backfill_node_reports_from_progress_log(self._store, execution_id)
             deliverables = generate_pfm_deliverables(self._store, execution_id)
             refreshed = self._store.get_execution(execution_id) or execution
             existing_by_filename = {
@@ -1588,6 +1880,39 @@ class ProjectExecutor:
         except Exception as exc:
             logger.warning(
                 "[executor] Failed to update template learning summary for %s: %s",
+                execution_id,
+                exc,
+            )
+
+        try:
+            refreshed = self._store.get_execution(execution_id) or execution
+            if (
+                refreshed.contributes_to_learning is not False
+                and refreshed.valid_for_data_reporting_training is not False
+                and self._store.get_committed_pfm_tree(execution_id)
+            ):
+                from projects.pfm_skills import (
+                    _skills_ready_for_injection,
+                    create_execution_pfm_skills,
+                    list_execution_pfm_skills,
+                )
+
+                if not _skills_ready_for_injection(list_execution_pfm_skills(self._store, execution_id)):
+                    result = create_execution_pfm_skills(self._store, execution_id)
+                    if result.get("ok"):
+                        logger.info(
+                            "[executor] Auto-created PFM skill files for execution %s",
+                            execution_id,
+                        )
+                    else:
+                        logger.warning(
+                            "[executor] Auto-create PFM skills skipped for %s: %s",
+                            execution_id,
+                            result.get("message") or result.get("error"),
+                        )
+        except Exception as exc:
+            logger.warning(
+                "[executor] Auto-create PFM skills failed for %s: %s",
                 execution_id,
                 exc,
             )
