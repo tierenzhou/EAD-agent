@@ -24,11 +24,14 @@ fixes that by routing all knowledge through a single atomic tool.
 ## Invariants
 
 1. Mindmap and per-node reports are derived only from the latest snapshot.
-2. The same input always produces the same Mermaid for any scope. Refresh
+2. **Readability:** each parent has at most **15** direct children; agents must nest deeper
+   instead of flat stars. Commits that violate this are rejected (`too_many_siblings`).
+   The UI renders one level at a time (`scope=top` / drill-down), not the full tree at once.
+3. The same input always produces the same Mermaid for any scope. Refresh
    cadence does not change semantics.
-3. Until a run sends its first snapshot, the UI shows an explicit "Awaiting
+4. Until a run sends its first snapshot, the UI shows an explicit "Awaiting
    first committed PFM tree (vN expected)" placeholder.
-4. **EAD reports on commit:** the **first** snapshot for a run must include
+5. **EAD reports on commit:** the **first** snapshot for a run must include
    non-empty Markdown for **every** node. On **later** checkpoints (typically
    every 2–5 minutes), the agent may send reports only for **new, changed, or
    deleted** work: unchanged nodes are **carried forward** from the prior

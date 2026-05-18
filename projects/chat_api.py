@@ -38,10 +38,31 @@ def _error_response(message: str, status: int = 400, code: str = "bad_request") 
 class ChatControlHandlers:
     """Handles /v1/chat/* API endpoints for project chat control."""
 
-    def __init__(self, session_db=None, agent_pool=None):
+    def __init__(self, session_db=None, agent_pool=None, project_store=None):
         self._session_db = session_db
         self._agent_pool = agent_pool
+        self._project_store = project_store
         self._idempotency_cache: Dict[str, float] = {}
+
+    def _execution_id_from_session_key(self, session_key: str) -> Optional[str]:
+        key = str(session_key or "").strip()
+        prefix = "eadproj-exec-"
+        if not key.startswith(prefix):
+            return None
+        execution_id = key[len(prefix):].strip()
+        return execution_id or None
+
+    def _is_closed_reporting_run(self, session_key: str) -> bool:
+        execution_id = self._execution_id_from_session_key(session_key)
+        if not execution_id or self._project_store is None:
+            return False
+        try:
+            ex = self._project_store.get_execution(execution_id)
+            if not ex:
+                return False
+            return str(getattr(ex, "reporting_activity_status", "") or "").strip().lower() == "closed"
+        except Exception:
+            return False
 
     def _get_session_db(self):
         if self._session_db is not None:
@@ -67,6 +88,12 @@ class ChatControlHandlers:
 
         if not session_key:
             return _error_response("session_key is required")
+        if self._is_closed_reporting_run(session_key):
+            return _error_response(
+                "This run is closed for reporting/knowledge retrieval; chat is disabled.",
+                409,
+                "run_closed",
+            )
 
         db = self._get_session_db()
 
@@ -101,6 +128,12 @@ class ChatControlHandlers:
             return _error_response("session_key is required")
         if not content:
             return _error_response("content is required")
+        if self._is_closed_reporting_run(session_key):
+            return _error_response(
+                "This run is closed for reporting/knowledge retrieval; chat is disabled.",
+                409,
+                "run_closed",
+            )
 
         if idempotency_key:
             if idempotency_key in self._idempotency_cache:
@@ -263,8 +296,16 @@ class ChatControlHandlers:
 
     async def handle_history(self, request: "web.Request") -> "web.Response":
         session_key = request.query.get("session_key")
-        limit = int(request.query.get("limit", "100"))
-        offset = int(request.query.get("offset", "0"))
+        try:
+            limit = int(request.query.get("limit", "100"))
+        except Exception:
+            limit = 100
+        try:
+            offset = int(request.query.get("offset", "0"))
+        except Exception:
+            offset = 0
+        limit = max(1, min(limit, 500))
+        offset = max(0, offset)
 
         if not session_key:
             return _error_response("session_key is required")
@@ -275,9 +316,8 @@ class ChatControlHandlers:
         if not session_id:
             return _json_response({"messages": [], "total": 0})
 
-        messages = db.get_messages(session_id)
-        total = len(messages)
-        sliced = messages[offset : offset + limit]
+        total = int(db.message_count(session_id))
+        sliced = db.get_messages_page(session_id, limit=limit, offset=offset)
 
         return _json_response(
             {
@@ -322,6 +362,12 @@ class ChatControlHandlers:
 
         if not session_key:
             return _error_response("session_key is required")
+        if self._is_closed_reporting_run(session_key):
+            return _error_response(
+                "This run is closed for reporting/knowledge retrieval; chat sessions are disabled.",
+                409,
+                "run_closed",
+            )
 
         db = self._get_session_db()
         session_id = self._resolve_session_id(db, session_key)

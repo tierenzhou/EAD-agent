@@ -1,0 +1,189 @@
+```mermaid
+mindmap
+  root((Project One<br/>Kloud 1.0<br/>P1 Test))
+    🔐 Authentication
+      Login Form
+      Username Input
+      Password Input
+      Log In Button
+      Remember Me Checkbox
+      Forgot Password Link
+      Language Selector English
+      Privacy Link
+      Terms Link
+    🏠 Home / Dashboard
+      Project Dashboard
+        Team Score Trend Chart
+        Management Team Scores Table
+        Requirement Dev Points Chart
+        Finished Points Distribution Pie
+        Development Sprint Burndown
+        Finished Task Points Chart
+        Test Case Monthly Created Chart
+      Project Overview
+        Pinned Projects List
+        Project Filter
+        Project Type Details
+        Project Owner
+        Project Status
+      Quick Actions
+        New Project
+        Project Request
+        Import Quick Start Guide
+    📋 Management
+      Team Score Dashboard
+        Member Attendance
+        Effort Tracking
+        Productivity Metrics
+        Contribution Scores
+        Quality Metrics
+        Work Objective Scores
+        Availability Scoring
+        Overall Score
+      Portfolio View
+        Project Portfolio List
+    📝 Requirement
+      Requirement List Table
+        ID Column Sortable
+        Title Column
+        Priority Order Column
+        Points Column
+        Spec Owner Column
+        State Column
+        Percent Finish Column
+        Percent Finish Star Column
+        Stories and Tasks Column
+        Picture Column
+        Row Checkbox Selection
+      Keywords Search
+      Month Week Filter
+        Month Selector
+        Week Selector
+      Requirement Creation
+        Add New Button
+      Pagination Controls
+        Page Numbers
+        Previous Next Arrows
+        Page Size 100 per Page
+      Summary Metrics Bar
+        Spec Points Total
+        Workload Percentage
+      Folder Tree Sidebar
+        Hide Show Tree Panel
+        Folder Search
+        Preference Settings
+        Filter Controls
+        Year Month Feature Hierarchy
+    💻 Development
+      Sprint Planning
+        Sprint Calendar Mon-Sun
+        Sprint Selector
+        Sprint Folder Tree
+      Task Board
+        List View
+        Task Board Kanban View
+        Gantt View
+        Resource View
+      User Time Tracking
+        User List
+        Time Spent
+        Time Remaining
+        Spec Points per User
+        Task Points Completed
+        Workload Percentage
+      Work Objective Score
+        Score Entry
+        Score Display
+      Task Management
+        Task Records
+        Task Status
+        Time Recording
+        Daily Task Tracking
+      Sidebar Filters
+        Show Closed Folder
+        Show Start End Time
+        Show Hours Spent
+        Show Current Folder Only
+        Define Task Template
+    🧪 Test Case
+      Test Case Library
+        Requirement List Integration
+        Month Filter
+        Keywords Search
+        Pagination 100 per Page
+        Folder Tree Navigation
+      Test Case Creation
+        Add New Button
+      Test Case Tools
+        Preference Settings
+        Filter Controls
+        Import Export Actions
+      Data Table
+        ID Column
+        Title Column
+        Priority Order Column
+        Points Column
+        Spec Owner Column
+        State Column
+        Percent Finish Column
+        Stories Tasks Column
+    🔄 Test Run
+      Test Run Management
+        Test Cycle Header
+        Test Cycle Selector
+        Tree Panel Toggle
+        Keywords Search
+        Add New Button
+      Test Run Data Table
+        Task ID Column
+        Release Version Column
+        Task Owner Column
+        Task State Column
+        Setup Time Column
+        Plan Start Date Column
+        Folder Search Input
+    📅 Meetings
+      Start Meeting
+      Schedule Meeting
+      Sprint Meeting Reports
+      View Meeting Channel
+    📚 Knowledge
+      Knowledge Base Articles
+        Knowledge ID
+        Title
+        Knowledge Owner
+        Knowledge State
+        Date Assigned
+        Due Date
+        Last Modified By
+      Keywords Search
+      Pagination 100 per Page
+      Folder Tree Multi-Project
+      Add Article
+      Article Tools
+        Hide Tree Panel
+        Preference Settings
+        Filter Controls
+    📊 Report
+      Dashboard Reports Integration
+      Summary Report View
+      Settings Button
+      Export Options
+        Export to Excel
+        Export to PDF
+        Export to HTML
+        Export to XML
+      Filter Controls
+    👤 User Profile
+      User Avatar Initials
+      Notifications Badge Count
+      User Menu Dropdown
+    🔄 Project Switcher
+      Kloud 1.0 Nov 2020-2024 Current
+      DevSuite 11 and ProjectOne
+      ServiceWise 11 Release
+      CW SW 11.0 Go
+      Additional Pinned Projects
+      New Project Creation
+      Quick Start Guide
+```

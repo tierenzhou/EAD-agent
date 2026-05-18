@@ -298,3 +298,23 @@ def test_compute_delivery_stamp_uses_filename_not_content(
     os.utime(fmr, (atime, mtime))
     stamp_b = compute_delivery_stamp("exec-v10")
     assert stamp_a.get("fingerprint") == stamp_b.get("fingerprint")
+
+
+def test_export_mmd_touch_does_not_trigger_rebuild() -> None:
+    """Touching pfm-mindmap.mmd alone must not rebuild when .FMR/.pfm are unchanged."""
+    prev = {
+        "source_delivery_files": [
+            {"name": "exec-v10.FMR", "mtime_ms": 5000},
+            {"name": "exec-v10.pfm", "mtime_ms": 5000},
+        ],
+    }
+    stamp = {
+        "fingerprint": "exec-v10.FMR:5000|exec-v10.pfm:5000",
+        "delivery_mtime_ms": 9000,
+        "files": [
+            {"name": "exec-v10.FMR", "mtime_ms": 5000},
+            {"name": "exec-v10.pfm", "mtime_ms": 5000},
+            {"name": "pfm-mindmap.mmd", "mtime_ms": 9000},
+        ],
+    }
+    assert delivery_changed(prev, stamp) is False

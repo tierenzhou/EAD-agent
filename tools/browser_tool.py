@@ -170,10 +170,8 @@ def _get_command_timeout() -> int:
     cached after the first call and cleared by ``cleanup_all_browsers()``.
     """
     global _cached_command_timeout, _command_timeout_resolved
-    if _command_timeout_resolved:
+    if _command_timeout_resolved and _cached_command_timeout is not None:
         return _cached_command_timeout  # type: ignore[return-value]
-
-    _command_timeout_resolved = True
     result = DEFAULT_COMMAND_TIMEOUT
     try:
         from hermes_cli.config import read_raw_config
@@ -185,6 +183,7 @@ def _get_command_timeout() -> int:
     except Exception as e:
         logger.debug("Could not read command_timeout from config: %s", e)
     _cached_command_timeout = result
+    _command_timeout_resolved = True
     return result
 
 

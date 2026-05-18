@@ -34,8 +34,11 @@ async def run_execution_bootstrap(
 ) -> None:
     """Copy PFM artifacts, sync mindmaps, create chat session, link run_session_key, start executor."""
     from projects.api import (
+        _build_phase1_canonical_baseline_message,
         _execution_ack_message,
-        _execution_scope_message,
+        _execution_boundary_message,
+        _try_inject_inherited_pfm_mindmap_cache,
+        enrich_execution_ai_prompt_with_learning,
     )
 
     t0 = time.perf_counter()
@@ -151,26 +154,55 @@ async def run_execution_bootstrap(
         return
 
     phase_start = time.perf_counter()
+    try:
+        enrich_execution_ai_prompt_with_learning(store, created.id)
+        refreshed = store.get_execution(created.id)
+        if refreshed:
+            created = refreshed
+    except Exception as exc:
+        logger.warning(
+            "[projects.bootstrap] enrich_execution_ai_prompt_with_learning failed for %s: %s",
+            created.id,
+            exc,
+        )
+    _log_phase("ai_prompt", phase_start)
+
+    phase_start = time.perf_counter()
+    template = store.get_template(template_id) if template_id else None
     session_bootstrap_ok = False
     try:
         from hermes_state import SessionDB
 
         db = SessionDB()
         session_id = f"eadproj-{uuid.uuid4().hex[:12]}"
-        boundary_message = _execution_scope_message(created)
+        boundary_message = _execution_boundary_message(created)
         db.create_session(
             session_id=session_id,
             source="api_server",
             system_prompt=boundary_message,
         )
         db.set_session_title(session_id, session_key)
-        # Boundary lives in session system_prompt only — not duplicated in the visible transcript.
-        # Phase-1 baseline and mindmap cache are injected post-login by the executor (with skills).
+        db.append_message(
+            session_id=session_id,
+            role="system",
+            content=boundary_message,
+        )
+        phase1_snap = _build_phase1_canonical_baseline_message(store, created)
+        if phase1_snap:
+            db.append_message(
+                session_id=session_id,
+                role="system",
+                content=phase1_snap,
+            )
+            logger.info("[projects.bootstrap] Phase-1 baseline injected for execution %s", created.id)
+        inh = getattr(created, "inherited_from_execution_id", None)
+        if inh and _try_inject_inherited_pfm_mindmap_cache(session_id, session_key, str(inh)):
+            logger.info("[projects.bootstrap] Injected mindmap cache from prior execution %s", inh)
 
         db.append_message(
             session_id=session_id,
             role="assistant",
-            content=_execution_ack_message(created),
+            content=_execution_ack_message(created, template=template),
         )
         logger.info("[projects.bootstrap] Bootstrapped session %s for execution %s", session_id, created.id)
 

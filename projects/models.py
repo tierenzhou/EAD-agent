@@ -35,6 +35,11 @@ class ExecutionStatus(str, Enum):
     ERROR = "error"
 
 
+class ReportingActivityStatus(str, Enum):
+    ACTIVE = "active"
+    CLOSED = "closed"
+
+
 class StepStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -248,6 +253,8 @@ class ProjectExecute(BaseModel):
     # data reporting, inherited training context, or template current reports.
     valid_for_data_reporting_training: Optional[bool] = None
     invalid_for_data_reporting_training_reason: Optional[str] = None
+    # Separate run lifecycle for reporting/knowledge retrieval workloads.
+    reporting_activity_status: ReportingActivityStatus = ReportingActivityStatus.ACTIVE
     # When this run was seeded from another execution's PFM artifacts / chat cache.
     inherited_from_execution_id: Optional[str] = None
     # Deferred bootstrap (POST /executions/run returns before seed/session complete).
@@ -263,6 +270,9 @@ class ProjectExecute(BaseModel):
     pfm_canonical_promotion_applied: Optional[bool] = None
     # Per-template ordinal (1 = oldest by start_time). PFM version V equals run_number.
     run_number: Optional[int] = None
+    # Operator Refresh EAD feature map (request-snapshot nudge / commit satisfaction).
+    pfm_refresh_pending_request_id: Optional[str] = None
+    pfm_refresh_satisfied_request_id: Optional[str] = None
 
 
 class ProjectsStoreFile(BaseModel):

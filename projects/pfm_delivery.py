@@ -11,10 +11,16 @@ is strictly newer than the DB baseline.
 
 from __future__ import annotations
 
+import logging
+import os
+import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .pfm_artifacts import report_file_path
+
+logger = logging.getLogger(__name__)
 
 # Legacy / export files — not used for refresh-vs-baseline comparison.
 _PFM_EXPORT_FILENAMES = (
@@ -35,12 +41,157 @@ def is_canonical_delivery_filename(name: str) -> bool:
 
 def _canonical_delivery_paths(execution_id: str) -> List[Path]:
     root = report_file_path(execution_id, PFM_REPORT_FILE).parent
-    if not root.is_dir():
-        return []
     paths: List[Path] = []
-    for pattern in _CANONICAL_GLOBS:
-        paths.extend(sorted(root.glob(pattern)))
+    if root.is_dir():
+        for pattern in _CANONICAL_GLOBS:
+            paths.extend(sorted(root.glob(pattern)))
+    paths.extend(_canonical_output_paths(execution_id))
     return sorted({p.resolve() for p in paths}, key=lambda p: str(p))
+
+
+def _canonical_output_paths(execution_id: str) -> List[Path]:
+    """
+    Extra canonical delivery location used by some agents:
+    ``$HERMES_HOME/output/*.pfm|*.fmr``.
+
+    Match by full execution id first, then short id prefix.
+    """
+    eid = str(execution_id or "").strip()
+    if not eid:
+        return []
+    short = eid[:8]
+    hermes_home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    out_dir = hermes_home / "output"
+    if not out_dir.is_dir():
+        return []
+
+    patterns: List[str] = []
+    for token in (eid, short):
+        if not token:
+            continue
+        patterns.extend(
+            [
+                f"*{token}*.pfm",
+                f"*{token}*.FMR",
+                f"*{token}*.fmr",
+            ]
+        )
+
+    paths: List[Path] = []
+    for pattern in patterns:
+        paths.extend(sorted(out_dir.glob(pattern)))
+    return sorted({p.resolve() for p in paths}, key=lambda p: str(p))
+
+
+def _export_delivery_paths(execution_id: str) -> List[Path]:
+    """Operator/agent export files under the execution reports directory."""
+    root = report_file_path(execution_id, PFM_REPORT_FILE).parent
+    paths: List[Path] = []
+    for fname in _PFM_EXPORT_FILENAMES:
+        path = root / fname
+        if path.is_file():
+            paths.append(path.resolve())
+    return paths
+
+
+def _slugify_run_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
+
+
+def discover_workspace_delivery_dirs(execution: Any) -> List[Path]:
+    """
+    Agents sometimes write ``projects/<run>-reports/pfm-mindmap.mmd`` in the repo
+    instead of the Hermes reports directory. Collect those folders for ingest.
+    """
+    projects_dir = Path(__file__).resolve().parent
+    if not projects_dir.is_dir():
+        return []
+
+    slugs: List[str] = []
+    for raw in (
+        getattr(execution, "name", None),
+        getattr(execution, "id", None),
+    ):
+        slug = _slugify_run_label(str(raw or ""))
+        if slug and slug not in slugs:
+            slugs.append(slug)
+    name_lower = str(getattr(execution, "name", "") or "").lower()
+    if "p1" in name_lower and "p1-test" not in slugs:
+        slugs.append("p1-test")
+
+    found: List[Path] = []
+    seen: set[str] = set()
+    for slug in slugs:
+        candidate = projects_dir / f"{slug}-reports"
+        if candidate.is_dir():
+            key = str(candidate.resolve())
+            if key not in seen:
+                seen.add(key)
+                found.append(candidate)
+    for candidate in sorted(projects_dir.glob("*-reports")):
+        if not candidate.is_dir():
+            continue
+        if not any((candidate / fname).is_file() for fname in _PFM_EXPORT_FILENAMES):
+            continue
+        key = str(candidate.resolve())
+        if key not in seen:
+            seen.add(key)
+            found.append(candidate)
+    return found
+
+
+def ingest_workspace_delivery_exports(store: Any, execution_id: str) -> Dict[str, Any]:
+    """
+    Copy agent workspace exports into ``reports/<execution_id>/`` and upsert DB artifacts
+    so operator Refresh can materialize the committed PFM tree.
+    """
+    execution = store.get_execution(execution_id)
+    if not execution:
+        return {"ok": False, "ingested": False, "files": []}
+
+    dest_dir = report_file_path(execution_id, PFM_MINDMAP_FILE).parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    copied: List[str] = []
+    now_ms = int(time.time() * 1000)
+
+    for src_dir in discover_workspace_delivery_dirs(execution):
+        for fname in _PFM_EXPORT_FILENAMES:
+            src = src_dir / fname
+            if not src.is_file():
+                continue
+            try:
+                text = src.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                logger.warning("[pfm_delivery] could not read %s: %s", src, exc)
+                continue
+            dest = dest_dir / fname
+            dest.write_text(text, encoding="utf-8")
+            if fname not in copied:
+                copied.append(fname)
+            artifact_type = "pfm_mindmap" if fname.endswith(".mmd") else "pfm_report"
+            if hasattr(store, "upsert_execution_pfm_artifact"):
+                store.upsert_execution_pfm_artifact(
+                    execution_id,
+                    fname,
+                    artifact_type,
+                    {
+                        "artifact_key": fname,
+                        "filename": fname,
+                        "format": fname.rsplit(".", 1)[-1],
+                        "title": "PFM Mindmap" if "mindmap" in fname else "PFM Report",
+                        "content": text,
+                        "created_at": now_ms,
+                    },
+                )
+        if copied:
+            logger.info(
+                "[pfm_delivery] Ingested workspace delivery for %s from %s: %s",
+                execution_id,
+                src_dir,
+                ", ".join(copied),
+            )
+
+    return {"ok": True, "ingested": bool(copied), "files": copied}
 
 
 def _file_time_ms(path: Path) -> int:
@@ -150,9 +301,10 @@ def has_newer_local_delivery(
     stamp: Dict[str, Any],
 ) -> bool:
     """
-    True when a local **.FMR** or **.pfm** file is newer than the DB baseline (or new).
+    True when a canonical delivery file (.FMR or .pfm on disk) is newer than the DB baseline.
+    Export files (pfm-mindmap.mmd, pfm-report.md) are ignored for rebuild decisions.
     """
-    current_files = filter_canonical_delivery_files(stamp.get("files"))
+    current_files = filter_canonical_delivery_files(_normalize_files_list(stamp.get("files")))
     if not current_files:
         fp = str(stamp.get("fingerprint") or "").strip()
         if fp and not _looks_like_legacy_content_hash(fp):
@@ -205,20 +357,39 @@ def delivery_changed(
     return has_newer_local_delivery(prev_snap, stamp)
 
 
-def compute_delivery_stamp(execution_id: str) -> Dict[str, Any]:
-    """Canonical delivery stamp: .FMR and .pfm only."""
+def compute_canonical_delivery_stamp(execution_id: str) -> Dict[str, Any]:
+    """Delivery stamp for rebuild decisions: .FMR and .pfm only (name + mtime)."""
     eid = str(execution_id or "").strip()
     if not eid:
         return {"fingerprint": "", "delivery_mtime_ms": 0, "files": []}
 
-    paths = _canonical_delivery_paths(eid)
-    files = _files_from_paths(paths)
+    files = _files_from_paths(_canonical_delivery_paths(eid))
     if not files:
         return {"fingerprint": "", "delivery_mtime_ms": 0, "files": []}
 
     max_mtime_ms = max(int(f.get("mtime_ms") or 0) for f in files)
     return {
         "fingerprint": _fingerprint_from_files(files),
+        "delivery_mtime_ms": max_mtime_ms,
+        "files": files,
+    }
+
+
+def compute_delivery_stamp(execution_id: str) -> Dict[str, Any]:
+    """Full on-disk listing (canonical + export files) for diagnostics only."""
+    eid = str(execution_id or "").strip()
+    if not eid:
+        return {"fingerprint": "", "delivery_mtime_ms": 0, "files": []}
+
+    paths = _canonical_delivery_paths(eid) + _export_delivery_paths(eid)
+    files = _files_from_paths(paths)
+    if not files:
+        return {"fingerprint": "", "delivery_mtime_ms": 0, "files": []}
+
+    canonical = filter_canonical_delivery_files(files)
+    max_mtime_ms = max(int(f.get("mtime_ms") or 0) for f in files)
+    return {
+        "fingerprint": _fingerprint_from_files(canonical) if canonical else "",
         "delivery_mtime_ms": max_mtime_ms,
         "files": files,
     }

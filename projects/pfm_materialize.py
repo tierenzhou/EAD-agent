@@ -13,6 +13,7 @@ commits).
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -30,7 +31,12 @@ from .pfm_artifacts import (
     nodes_from_markdown_fenced_mermaid,
     report_file_path,
 )
-from .pfm_tree import SnapshotValidationError, validate_and_normalize_snapshot
+from .pfm_tree import (
+    SnapshotValidationError,
+    _is_junk_mindmap_node_title,
+    strip_pfm_node_display_title,
+    validate_and_normalize_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -175,10 +181,91 @@ def _nodes_from_pfm_artifacts_and_disk(store: Any, execution_id: str) -> List[Ea
     return []
 
 
+def _nodes_from_canonical_pfm_schema(execution_id: str) -> tuple[List[EadFmNodeRun], str]:
+    """
+    Parse canonical ``.pfm`` delivery as the strict node source for delivery refresh.
+
+    Returns ``(nodes, error)`` where ``error`` is non-empty on parse/validation failure.
+    """
+    from .pfm_delivery import _canonical_delivery_paths
+
+    eid = str(execution_id or "").strip()
+    if not eid:
+        return [], ""
+    pfm_paths = [p for p in _canonical_delivery_paths(eid) if p.suffix.lower() == ".pfm"]
+    if not pfm_paths:
+        return [], ""
+
+    # Prefer newest delivery when multiple copies exist (e.g., reports dir + ~/.hermes/output).
+    pfm_paths.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    path = pfm_paths[0]
+    raw_text = ""
+    try:
+        raw_text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return [], f"Could not read canonical .pfm delivery {path.name}: {exc}"
+
+    payload: Dict[str, Any] = {}
+    parsed_json = False
+    try:
+        candidate = json.loads(raw_text)
+        if isinstance(candidate, dict):
+            payload = candidate
+            parsed_json = True
+    except Exception:
+        parsed_json = False
+
+    if not parsed_json:
+        # Some agents deliver .pfm as raw Mermaid mindmap text (not JSON schema).
+        # Accept that format and derive nodes directly.
+        text_nodes = derive_pfm_nodes_from_saved_mindmap_or_report_text(raw_text)
+        if text_nodes:
+            return text_nodes, ""
+        return [], (
+            f"Canonical .pfm delivery {path.name} is neither valid JSON schema "
+            "nor parseable Mermaid mindmap text."
+        )
+
+    rows = payload.get("nodes")
+    if not isinstance(rows, list) or not rows:
+        return [], f"Canonical .pfm delivery {path.name} has no nodes[] payload."
+
+    out: List[EadFmNodeRun] = []
+    for idx, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            continue
+        try:
+            node = EadFmNodeRun.model_validate(
+                {
+                    "nodeKey": row.get("nodeKey"),
+                    "nodeId": row.get("nodeId") or row.get("nodeKey") or f"pfm-node-{idx}",
+                    "parentNodeKey": row.get("parentNodeKey"),
+                    "level": row.get("level") or 0,
+                    "type": row.get("type") or "",
+                    "title": row.get("title") or row.get("nodeKey") or f"PFM node {idx}",
+                    "meta": row.get("meta") or "",
+                    "status": row.get("status") or "No Run",
+                }
+            )
+        except Exception:
+            continue
+        if not (node.node_key or "").strip():
+            continue
+        out.append(node)
+    if not out:
+        return [], f"Canonical .pfm delivery {path.name} parsed zero valid nodes."
+    return out, ""
+
+
 def _collect_nodes_for_materialize(store: Any, execution: ProjectExecute) -> List[EadFmNodeRun]:
-    raw_results = list(execution.results or [])
-    progress_nodes = derive_pfm_nodes_from_report_running_step_progress(execution.progress_log or [])
     artifact_nodes = _nodes_from_pfm_artifacts_and_disk(store, execution.id)
+    raw_results = list(execution.results or [])
+    if artifact_nodes and (
+        _nodes_are_hierarchical(artifact_nodes) or len(artifact_nodes) >= 3
+    ) and not raw_results:
+        return artifact_nodes
+
+    progress_nodes = derive_pfm_nodes_from_report_running_step_progress(execution.progress_log or [])
     if progress_nodes:
         # report_running_step snapshots can be partial (e.g. top-level only); prefer
         # artifact trees when they are clearly deeper.
@@ -217,7 +304,7 @@ def _node_run_to_tree_dict(
     desc = (node.meta or "").strip() or (node.title or nk) or ""
     out: Dict[str, Any] = {
         "node_key": nk,
-        "title": (node.title or nk)[:240],
+        "title": strip_pfm_node_display_title(node.title or nk)[:240],
         "level": max(1, int(node.level or 1)),
         "type": str(node.type or "feature-area"),
         "status": st_txt,
@@ -485,12 +572,31 @@ def materialize_operator_pfm_snapshot(
             "message": "Run is active with a committed tree; use commit_pfm_snapshot for updates.",
         }
 
-    nodes = _collect_nodes_for_materialize(store, execution)
+    nodes: List[EadFmNodeRun] = []
+    if delivery_refresh:
+        strict_nodes, strict_error = _nodes_from_canonical_pfm_schema(execution_id)
+        if strict_nodes:
+            nodes = strict_nodes
+        elif strict_error:
+            return {"ok": False, "code": "invalid_pfm_schema", "message": strict_error}
+    if not nodes:
+        nodes = _collect_nodes_for_materialize(store, execution)
     if not nodes:
         return {
             "ok": False,
             "code": "no_nodes",
             "message": "No PFM nodes found in results, progress, saved mindmap/report artifacts, or disk.",
+        }
+    if not _nodes_are_hierarchical(nodes) and all(
+        _is_junk_mindmap_node_title(str(n.title or "")) for n in nodes[: min(len(nodes), 8)]
+    ):
+        return {
+            "ok": False,
+            "code": "no_nodes",
+            "message": (
+                "Saved content looks like agent progress text, not a PFM feature tree. "
+                "Wait for commit_pfm_snapshot or deliver a valid .FMR/.pfm map."
+            ),
         }
 
     prev = store.get_committed_pfm_tree(execution_id)
@@ -554,6 +660,7 @@ def materialize_operator_pfm_snapshot(
     payload: Dict[str, Any] = {
         "execution_id": execution_id,
         "generated_at": int(time.time() * 1000),
+        "version": int(rev),
         "roots": roots_payload,
         "cross_cutting": [],
         "node_reports": node_reports,
@@ -562,15 +669,16 @@ def materialize_operator_pfm_snapshot(
     try:
         snap, _, reps = validate_and_normalize_snapshot(
             payload,
-            generation=gen,
-            revision=rev,
-            previous_revision=prev_rev,
+            previous_version=prev_rev,
             report_carry_source_keys=carry_keys,
             report_carry_library=carry_lib,
         )
     except SnapshotValidationError as exc:
         logger.warning("[pfm_materialize] validate failed for %s: %s", execution_id, exc)
         return {"ok": False, "code": getattr(exc, "code", "snapshot_invalid"), "message": str(exc)}
+    snap["generation"] = int(gen)
+    snap["revision"] = int(rev)
+    snap["version"] = int(rev)
 
     if not source_fingerprint or not source_delivery_files:
         from .pfm_delivery import compute_delivery_stamp

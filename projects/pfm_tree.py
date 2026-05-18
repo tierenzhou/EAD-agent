@@ -34,14 +34,41 @@ PFM_TREE_ARTIFACT_TYPE = "pfm_tree"
 PFM_VIEW_STATE_ARTIFACT_KEY = "pfm-view-state.json"
 PFM_VIEW_STATE_ARTIFACT_TYPE = "pfm_view_state"
 
-# Committed tree + view state belong to one execution; never copy on PFM seed/inherit.
-NON_INHERITABLE_PFM_ARTIFACT_TYPES = frozenset(
-    {PFM_TREE_ARTIFACT_TYPE, PFM_VIEW_STATE_ARTIFACT_TYPE}
-)
-
 NODE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-./]*$")
 MAX_TREE_DEPTH = 24
 MAX_NODES = 5000
+# Operator mindmap readability: UI drills down one level at a time.
+MAX_SIBLINGS_PER_PARENT = 15
+
+PFM_HIERARCHY_READABILITY_RULES = (
+    "PFM MINDMAP READABILITY (mandatory for commit_pfm_snapshot and report_running_step pfm_node):\n"
+    "- Build a **multi-level** tree: product domain → functional area → feature group → specific feature.\n"
+    f"- At **each** parent node, include at most **{MAX_SIBLINGS_PER_PARENT}** direct children (siblings). "
+    "If you discover more, add an intermediate grouping level (e.g. `home/task_board/columns` "
+    "instead of 30 nodes directly under `home`).\n"
+    "- Do **not** hang table column headers, filter chips, pagination labels, or other UI chrome as "
+    "separate mindmap nodes unless they are true product capabilities. Put that detail in the node's "
+    "EAD Markdown report instead.\n"
+    "- Operators navigate the UI mindmap level-by-level; design the tree for drill-down, not one giant flat star.\n"
+)
+
+PFM_NODE_TITLE_RULES = (
+    "PFM NODE TITLES (displayed on the mindmap):\n"
+    "- Use the **functional name only** (e.g. Authentication, Home / Task Board).\n"
+    "- Do **not** prefix titles with outline numbers (wrong: `1. Authentication`, `2. Home`).\n"
+    "- Do **not** prefix with emojis used as list markers; put status in the node status field instead.\n"
+)
+
+PFM_PARENT_KEY_RULES = (
+    "PFM PARENT / HUB RULES (mandatory for commit_pfm_snapshot):\n"
+    "- The operator UI center is the **project/run name** (e.g. P1 Test) — not shown as a breadcrumb step.\n"
+    "- The operator UI center is the **project/run name** (e.g. P1 Test) — not a separate mindmap node.\n"
+    "- Use **at most one** hub node with parent_node_key null (product root). All functional modules "
+    "(Authentication, Home, Management, …) MUST be children of that hub: parent_node_key = hub node_key.\n"
+    "- **Never** set parent_node_key null on modules, pages, columns, filters, or UI-detail nodes.\n"
+    "- node_key pattern: hub `p1-test` → module `p1-test/authentication`, not `authentication` with null parent.\n"
+    "- The first mindmap screen shows the hub's children around the run name; drill-down uses focus on each module.\n"
+)
 
 
 def snapshot_generation(snap: Optional[Dict[str, Any]]) -> int:
@@ -83,7 +110,7 @@ def baseline_generation_from_snap(snap: Optional[Dict[str, Any]]) -> int:
     Generation on a prior run's tree (for v9 → v10).
 
     Legacy trees stored only ``version``; on canonical/baseline runs that counter
-  often equals template generation.
+    often equals template generation.
     """
     gen = snapshot_generation(snap)
     if gen > 0:
@@ -149,14 +176,12 @@ def committed_tree_node_keys(snapshot: Optional[Dict[str, Any]]) -> Set[str]:
 
 
 def collect_node_report_markdown_by_key(store: Any, execution_id: str) -> Dict[str, Dict[str, str]]:
-    """Build node_key -> {title, markdown} from DB artifacts and canonical .FMR on disk."""
-    from .pfm_fmr_parse import load_canonical_fmr_reports, merge_fmr_reports_into_library
-
+    """Build node_key -> {title, markdown} from persisted node_ead_report rows."""
     out: Dict[str, Dict[str, str]] = {}
     try:
         rows = store.list_execution_pfm_artifacts(execution_id)
     except Exception:
-        rows = []
+        return out
     for art in rows or []:
         if str(art.get("artifact_type") or "") != "node_ead_report":
             continue
@@ -170,7 +195,6 @@ def collect_node_report_markdown_by_key(store: Any, execution_id: str) -> Dict[s
             "title": str(art.get("title") or nk),
             "markdown": md,
         }
-    merge_fmr_reports_into_library(out, load_canonical_fmr_reports(execution_id))
     return out
 
 
@@ -191,7 +215,9 @@ def _walk_tree(
         if not isinstance(raw, dict):
             raise SnapshotValidationError("tree node must be an object", code="node_not_object")
         node_key = str(raw.get("node_key") or "").strip()
-        title = str(raw.get("title") or "").strip()
+        title = strip_pfm_node_display_title(str(raw.get("title") or ""))
+        if not title:
+            title = str(raw.get("title") or "").strip()
         if not node_key:
             raise SnapshotValidationError("every node requires node_key", code="missing_node_key")
         if not NODE_KEY_RE.match(node_key):
@@ -259,13 +285,36 @@ def _walk_tree(
         _walk_tree(children, node_key, depth + 1, seen_keys, flat, is_cross_cutting)
 
 
+def _enforce_sibling_limits(flat: List[Dict[str, Any]]) -> None:
+    """Reject snapshots where any parent has more than MAX_SIBLINGS_PER_PARENT direct children."""
+    from collections import defaultdict
+
+    counts: Dict[Optional[str], int] = defaultdict(int)
+    for node in flat:
+        parent = node.get("parent_node_key")
+        if parent is not None and not str(parent).strip():
+            parent = None
+        counts[parent] += 1
+    violations = [
+        (parent, count)
+        for parent, count in counts.items()
+        if count > MAX_SIBLINGS_PER_PARENT
+    ]
+    if not violations:
+        return
+    parent_key, count = max(violations, key=lambda item: item[1])
+    parent_label = parent_key if parent_key else "(top level)"
+    raise SnapshotValidationError(
+        f"parent {parent_label!r} has {count} direct children; maximum is {MAX_SIBLINGS_PER_PARENT}. "
+        "Add intermediate grouping levels and move UI-detail text into node EAD reports.",
+        code="too_many_siblings",
+    )
+
+
 def validate_and_normalize_snapshot(
     payload: Dict[str, Any],
     *,
-    generation: int = 0,
-    revision: int = 0,
     previous_version: int = 0,
-    previous_revision: int = 0,
     report_carry_source_keys: Optional[Set[str]] = None,
     report_carry_library: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Tuple[Dict[str, Any], List[EadFmNodeRun], List[Dict[str, Any]]]:
@@ -281,36 +330,26 @@ def validate_and_normalize_snapshot(
     that set may omit ``node_reports[]`` — the prior Markdown is carried forward.
     Keys **new** to this tree (not in ``report_carry_source_keys``) must always
     appear in ``node_reports`` with non-empty markdown. First snapshot
-    (no prior tree): pass empty carry sets so every node requires a fresh report.
+    (no prior tree): ``report_carry_source_keys`` may still list node_keys that
+    already have ``node_ead_report`` rows on disk (inheritance seed); those may
+    omit fresh markdown. If carry sets are empty, every node requires a new report.
 
     Raises SnapshotValidationError with `code` set so the agent gets a stable error.
     """
     if not isinstance(payload, dict):
         raise SnapshotValidationError("payload must be an object", code="payload_not_object")
 
-    prev_rev = max(int(previous_revision or 0), int(previous_version or 0))
-    if generation > 0 and revision > 0:
-        gen, rev = int(generation), int(revision)
-        if prev_rev and rev <= prev_rev:
-            raise SnapshotValidationError(
-                f"revision {rev} must be strictly greater than current revision {prev_rev}",
-                code="stale_revision",
-            )
-    else:
-        try:
-            rev = int(payload.get("version") or 0)
-        except Exception:
-            raise SnapshotValidationError("version must be an integer", code="invalid_version")
-        if rev <= 0:
-            raise SnapshotValidationError("version must be a positive integer", code="invalid_version")
-        if prev_rev and rev <= prev_rev:
-            raise SnapshotValidationError(
-                f"version {rev} must be strictly greater than current pfm_tree_version {prev_rev}",
-                code="stale_version",
-            )
-        gen = int(payload.get("generation") or 0)
-        if gen <= 0:
-            gen = 0
+    try:
+        version = int(payload.get("version") or 0)
+    except Exception:
+        raise SnapshotValidationError("version must be an integer", code="invalid_version")
+    if version <= 0:
+        raise SnapshotValidationError("version must be a positive integer", code="invalid_version")
+    if previous_version and version <= previous_version:
+        raise SnapshotValidationError(
+            f"version {version} must be strictly greater than current pfm_tree_version {previous_version}",
+            code="stale_version",
+        )
 
     generated_at = payload.get("generated_at")
     try:
@@ -331,6 +370,7 @@ def validate_and_normalize_snapshot(
     flat: List[Dict[str, Any]] = []
     _walk_tree(roots_raw, None, 1, seen_keys, flat, False)
     _walk_tree(cross_raw, None, 1, seen_keys, flat, True)
+    _enforce_sibling_limits(flat)
 
     reports_raw = payload.get("node_reports") or []
     if not isinstance(reports_raw, list):
@@ -407,18 +447,13 @@ def validate_and_normalize_snapshot(
             )
         )
 
-    finalized = bool(payload.get("finalized")) if payload.get("finalized") is not None else False
-    normalized: Dict[str, Any] = {
-        "revision": rev,
-        "version": rev,
+    normalized = {
+        "version": version,
         "generated_at": generated_at_ms,
         "roots": roots_raw,
         "cross_cutting": cross_raw,
         "flat_nodes": flat,
-        "finalized": finalized,
     }
-    if gen > 0:
-        normalized["generation"] = gen
     return normalized, flat_runs, list(reports_by_key.values())
 
 
@@ -498,17 +533,345 @@ def _path_to_root(node_key: str, by_key: Dict[str, Dict[str, Any]]) -> List[Dict
     return path
 
 
-def _mermaid_label(node: Dict[str, Any]) -> str:
-    """
-    Mindmap node text for Mermaid ``mindmap`` output.
+def _execution_project_center_title(execution: ProjectExecute) -> str:
+    """Run/project label for the mindmap center (strip leading ``Run:`` from execution name)."""
+    raw = str(execution.name or execution.id or "PFM Run").strip()
+    raw = re.sub(r"^Run:\s*", "", raw, flags=re.IGNORECASE).strip() or str(
+        execution.id or "PFM Run"
+    )
+    return _sanitize_mermaid_mindmap_text(raw, fallback=execution.id or "PFM Run")
 
-    Use **title only** (no trailing ``[status]``): bracketed suffixes confuse Mermaid
-    mindmap rendering and often collapse to misleading single-word boxes.
+
+_CENTER_HUB_TITLES = frozenset(
+    {"hub", "internal hub", "pfm hub", "center hub"},
+)
+
+
+def _slug_last_segment(node_key: str) -> str:
+    key = str(node_key or "").strip()
+    if "/" in key:
+        return key.rsplit("/", 1)[-1].lower()
+    return key.lower()
+
+
+def _is_likely_center_hub_row(node: Dict[str, Any]) -> bool:
+    """True for the hidden internal hub row, not product modules promoted to null parent."""
+    key = str(node.get("node_key") or "").strip()
+    if not key:
+        return False
+    title = str(node.get("title") or "").strip().lower()
+    slug = _slug_last_segment(key)
+    if slug in ("hub", "pfm-hub", "product-hub") or slug.endswith("-hub"):
+        return True
+    if title in _CENTER_HUB_TITLES:
+        return True
+    if key.lower() in ("hub", "pfm-hub", "product-hub"):
+        return True
+    return False
+
+
+def collect_center_hub_keys(flat: List[Dict[str, Any]]) -> Set[str]:
     """
-    raw = str(node.get("title") or node.get("node_key") or "node").strip().replace("\n", " ")
-    if len(raw) > 92:
-        raw = raw[:89] + "..."
+    Internal center hub row keys (hidden in the UI).
+
+    After ``normalize_operator_flat_nodes``, product modules use null parent and
+    are **not** hub rows. Only null-parent nodes that are referenced as parent and
+    look like a hub (or the lone null-parent hub in the canonical shape) qualify.
+    """
+    nodes = list(flat or [])
+    null_parent: List[Dict[str, Any]] = []
+    child_parent_keys: Set[str] = set()
+    for node in nodes:
+        key = str(node.get("node_key") or "").strip()
+        if not key:
+            continue
+        parent = str(node.get("parent_node_key") or "").strip()
+        if parent:
+            child_parent_keys.add(parent)
+        else:
+            null_parent.append(node)
+
+    if not null_parent:
+        return set()
+
+    if len(null_parent) == 1:
+        only = null_parent[0]
+        only_key = str(only.get("node_key") or "").strip()
+        if not only_key:
+            return set()
+        if only_key in child_parent_keys:
+            return {only_key}
+        if _is_likely_center_hub_row(only):
+            return {only_key}
+        return set()
+
+    hubs: Set[str] = set()
+    for node in null_parent:
+        key = str(node.get("node_key") or "").strip()
+        if not key or key not in child_parent_keys:
+            continue
+        if _is_likely_center_hub_row(node):
+            hubs.add(key)
+    return hubs
+
+
+def is_operator_top_level_node(
+    node: Dict[str, Any],
+    center_hub_keys: Set[str],
+) -> bool:
+    """
+    Operator top-level spokes around the run name (not the hidden hub row).
+
+    A node is top-level when parent is null (legacy) or parent is a center hub key.
+    """
+    key = str(node.get("node_key") or "").strip()
+    if not key or key in center_hub_keys:
+        return False
+    if _is_junk_mindmap_node_title(str(node.get("title") or "")):
+        return False
+    parent = str(node.get("parent_node_key") or "").strip()
+    if not parent:
+        return True
+    if parent in center_hub_keys:
+        return True
+    return False
+
+
+def operator_top_level_spoke_nodes(flat: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Product modules shown on the first mindmap screen (run name at center)."""
+    hub_keys = collect_center_hub_keys(flat)
+    spokes = [n for n in flat if is_operator_top_level_node(n, hub_keys)]
+    spokes.sort(
+        key=lambda n: (int(n.get("level") or 0), str(n.get("title") or n.get("node_key") or "").lower()),
+    )
+    return spokes
+
+
+def normalize_operator_flat_nodes(flat: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Remove internal center hub rows and promote hub children to null-parent modules.
+
+    Also collapses duplicate hub path segments in node_key / parent_node_key.
+    """
+    hub_keys = collect_center_hub_keys(flat)
+    if not hub_keys:
+        out: List[Dict[str, Any]] = []
+        for node in flat or []:
+            row = dict(node)
+            nk = collapse_duplicate_hub_path_segments(str(row.get("node_key") or ""))
+            pk = str(row.get("parent_node_key") or "").strip()
+            pk = collapse_duplicate_hub_path_segments(pk) if pk else ""
+            row["node_key"] = nk
+            row["node_id"] = str(row.get("node_id") or nk)
+            if pk:
+                row["parent_node_key"] = pk
+            else:
+                row["parent_node_key"] = None
+            out.append(row)
+        return out
+
+    out: List[Dict[str, Any]] = []
+    for node in flat or []:
+        key = str(node.get("node_key") or "").strip()
+        if not key or key in hub_keys:
+            continue
+        row = dict(node)
+        nk = collapse_duplicate_hub_path_segments(key)
+        parent = str(node.get("parent_node_key") or "").strip()
+        if parent in hub_keys:
+            parent = ""
+        elif parent:
+            parent = collapse_duplicate_hub_path_segments(parent)
+        row["node_key"] = nk
+        row["node_id"] = str(row.get("node_id") or nk)
+        row["parent_node_key"] = parent or None
+        out.append(row)
+    return out
+
+
+def _top_level_spoke_nodes(
+    children: Dict[Optional[str], List[Dict[str, Any]]],
+    flat: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Backward-compatible wrapper; prefer ``operator_top_level_spoke_nodes(flat)``."""
+    if flat is not None:
+        return operator_top_level_spoke_nodes(flat)
+    null_roots = list(children.get(None) or [])
+    hub_keys = {str(n.get("node_key") or "").strip() for n in null_roots if n.get("node_key")}
+    spokes: List[Dict[str, Any]] = []
+    for parent_key, plist in children.items():
+        if parent_key is None or str(parent_key).strip() in hub_keys:
+            for n in plist or []:
+                nk = str(n.get("node_key") or "").strip()
+                if nk and nk not in hub_keys:
+                    spokes.append(n)
+    if not spokes:
+        spokes = null_roots
+    return [n for n in spokes if not _is_junk_mindmap_node_title(str(n.get("title") or ""))]
+
+
+def collapse_duplicate_hub_path_segments(node_key: str) -> str:
+    """Collapse consecutive duplicate path segments (``hub/hub/module`` → ``hub/module``)."""
+    parts = [p.strip() for p in str(node_key or "").split("/") if p.strip()]
+    if len(parts) < 2:
+        return str(node_key or "").strip()
+    out: List[str] = []
+    for part in parts:
+        if out and out[-1] == part:
+            continue
+        out.append(part)
+    return "/".join(out)
+
+
+def resolve_node_key_in_snapshot(
+    node_key: Optional[str],
+    by_key: Dict[str, Dict[str, Any]],
+) -> Optional[str]:
+    """
+    Map operator UI keys to canonical ``flat_nodes`` node_key values.
+
+    Committed trees may store duplicate hub segments (``hub/hub/module``) while
+    breadcrumbs or legacy paths send a collapsed key (``hub/module``).
+    """
+    raw = str(node_key or "").strip()
+    if not raw or not by_key:
+        return None
+    if raw in by_key:
+        return raw
+    collapsed = collapse_duplicate_hub_path_segments(raw)
+    if collapsed in by_key:
+        return collapsed
+    collapsed_matches = [
+        stored
+        for stored in by_key
+        if collapse_duplicate_hub_path_segments(stored) == collapsed
+    ]
+    if len(collapsed_matches) == 1:
+        return collapsed_matches[0]
+    if len(collapsed_matches) > 1:
+        last = collapsed.rsplit("/", 1)[-1].lower()
+        suffix_matches = [
+            stored
+            for stored in collapsed_matches
+            if stored.rsplit("/", 1)[-1].lower() == last
+        ]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
+    last = raw.rsplit("/", 1)[-1].lower()
+    if last:
+        seg_matches = [
+            stored for stored in by_key if stored.rsplit("/", 1)[-1].lower() == last
+        ]
+        if len(seg_matches) == 1:
+            return seg_matches[0]
+    return None
+
+
+def strip_pfm_node_display_title(title: str) -> str:
+    """Human-readable PFM title: no leading outline numbers (``1.``, ``1.2.``) or list emojis."""
+    raw = re.sub(r"\r?\n+", " ", str(title or "")).strip()
+    raw = re.sub(r"<br\s*/?>", " ", raw, flags=re.IGNORECASE)
+    prev = ""
+    while prev != raw:
+        prev = raw
+        raw = re.sub(r"^[\s\U0001F300-\U0001FAFF]+", "", raw)
+        raw = re.sub(r"^(?:\d+\.)+\s*", "", raw)
+        raw = re.sub(r"^\d+\s+", "", raw)
+    return re.sub(r"\s{2,}", " ", raw).strip()
+
+
+def _humanize_node_key_slug(node_key: str) -> str:
+    slug = str(node_key or "").strip().split("/")[-1] or "node"
+    slug = re.sub(r"[-_]+", " ", slug).strip()
+    return slug[:72].strip() or "node"
+
+
+def _sanitize_mermaid_mindmap_text(value: str, *, fallback: str = "node") -> str:
+    """Strip markdown HR / mindmap-breaking punctuation from a single node label."""
+    if _is_junk_mindmap_node_title(str(value or "")):
+        value = _humanize_node_key_slug(fallback)
+    raw = strip_pfm_node_display_title(str(value or ""))
+    if not raw:
+        raw = re.sub(r"\r?\n+", " ", str(value or "")).strip()
+        raw = re.sub(r"<br\s*/?>", " ", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"#{1,6}\s*", "", raw)
+    raw = re.sub(r"\*\*([^*]+)\*\*", r"\1", raw)
+    raw = re.sub(r"`([^`]+)`", r"\1", raw)
+    raw = re.sub(r"[\u2010-\u2015\u2212\u2500-\u2503\-]{3,}", " ", raw)
+    raw = re.sub(r"_{3,}", " ", raw)
+    raw = re.sub(r"={3,}", " ", raw)
+    raw = re.sub(r"\s{2,}", " ", raw).strip()
+    if not raw or re.fullmatch(r"[-_.= \u2010-\u2015]+", raw):
+        raw = _humanize_node_key_slug(fallback)
+    if len(raw) > 72:
+        raw = raw[:69] + "..."
     return raw.replace("(", "[").replace(")", "]").replace('"', "'")
+
+
+_AGENT_NARRATION_RE = re.compile(
+    r"(?i)\b(let me|i'll|i've|i am|screenshot|captured|login page|timeout|console shows|"
+    r"navigating to|proceed with|check the current state|starting now)\b"
+)
+
+
+def _is_junk_mindmap_node_title(title: str) -> bool:
+    """True when a flat_nodes title is markdown chrome or agent narration, not a PFM feature name."""
+    raw = re.sub(r"\r?\n+", " ", str(title or "")).strip()
+    if not raw:
+        return True
+    if re.fullmatch(r"[-_.= \u2010-\u2015]+", raw):
+        return True
+    if re.fullmatch(r"[\u2010-\u2015\-]{3,}", raw):
+        return True
+    if raw.startswith("##") or raw.startswith("# "):
+        return True
+    if len(raw) > 72:
+        return True
+    if _AGENT_NARRATION_RE.search(raw):
+        return True
+    words = [w for w in raw.split() if w]
+    if len(words) > 10:
+        return True
+    return False
+
+
+def tree_looks_like_agent_narration_flat(flat: List[Dict[str, Any]]) -> bool:
+    """True when committed flat_nodes are mostly null-parent agent log lines, not a product tree."""
+    if len(flat) < 3:
+        return False
+    null_parent = sum(1 for n in flat if not str(n.get("parent_node_key") or "").strip())
+    if null_parent < max(3, int(len(flat) * 0.75)):
+        return False
+    junk = sum(1 for n in flat if _is_junk_mindmap_node_title(str(n.get("title") or "")))
+    return junk >= max(2, int(len(flat) * 0.6))
+
+
+def sanitize_mermaid_diagram(definition: str) -> str:
+    """Final pass on rendered mindmap text before the UI hands it to Mermaid."""
+    out: List[str] = []
+    for line in str(definition or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.fullmatch(r"[-_.=\u2010-\u2015]{3,}", stripped):
+            continue
+        cleaned = re.sub(r"[\u2010-\u2015\u2212\u2500-\u2503\-]{3,}", " ", line)
+        cleaned = re.sub(r"<br\s*/?>", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"_{3,}", " ", cleaned)
+        cleaned = re.sub(r"={3,}", " ", cleaned)
+        if cleaned.strip():
+            out.append(cleaned.rstrip())
+    if not out:
+        return "mindmap\n  root((PFM))\n    No nodes\n"
+    return "\n".join(out) + "\n"
+
+
+def _mermaid_label(node: Dict[str, Any]) -> str:
+    fallback = str(node.get("node_key") or "node").strip() or "node"
+    return _sanitize_mermaid_mindmap_text(
+        str(node.get("title") or fallback),
+        fallback=fallback,
+    )
 
 
 def _emit_subtree(
@@ -521,6 +884,8 @@ def _emit_subtree(
 ) -> None:
     key = str(node.get("node_key") or "")
     if not key or key in emitted:
+        return
+    if _is_junk_mindmap_node_title(str(node.get("title") or "")):
         return
     emitted.add(key)
     indent = " " * max(2 + 2 * depth, 4)
@@ -543,71 +908,78 @@ def render_mermaid_for_scope(
     flat = list(snapshot.get("flat_nodes") or []) if isinstance(snapshot, dict) else []
     by_key = _index_flat(flat)
     children = _children_index(flat)
+    center_hubs = collect_center_hub_keys(flat)
+    resolved_key = resolve_node_key_in_snapshot(node_key, by_key) if node_key else None
+    if resolved_key and resolved_key in center_hubs:
+        resolved_key = None
 
     if not flat:
-        root_title = (execution.name or execution.id or "PFM Run").replace("\n", " ").strip()
-        if len(root_title) > 80:
-            root_title = root_title[:77] + "..."
-        root_title = root_title.replace("(", "[").replace(")", "]")
+        root_title = _execution_project_center_title(execution)
         lines = ["mindmap", f"  root(({root_title}))"]
         lines.append("    No PFM tree committed yet")
         return "\n".join(lines) + "\n"
 
     s = (scope or "top").strip().lower()
-    if s == "focus" and node_key and node_key in by_key:
-        root_title = _mermaid_label(by_key[node_key])
+    if s == "focus" and resolved_key:
+        root_title = _mermaid_label(by_key[resolved_key])
     else:
-        root_title = (execution.name or execution.id or "PFM Run").replace("\n", " ").strip()
-        if len(root_title) > 80:
-            root_title = root_title[:77] + "..."
-        root_title = root_title.replace("(", "[").replace(")", "]")
+        root_title = _execution_project_center_title(execution)
     lines = ["mindmap", f"  root(({root_title}))"]
     emitted: set = set()
 
     if s == "top":
-        roots = children.get(None, [])
-        for r in roots:
+        if tree_looks_like_agent_narration_flat(flat):
+            lines.append("    Invalid PFM tree (agent log lines, not features)")
+            lines.append("    Use a run with commit_pfm_snapshot or refresh delivery")
+            return sanitize_mermaid_diagram("\n".join(lines) + "\n")
+        for r in operator_top_level_spoke_nodes(flat):
             _emit_subtree(lines, r, 1, children, 1, emitted)
-        return "\n".join(lines) + "\n"
+        if not emitted:
+            lines.append("    No displayable PFM modules in committed tree")
+        return sanitize_mermaid_diagram("\n".join(lines) + "\n")
 
     if s == "focus":
         if node_key:
-            if node_key not in by_key:
-                return "\n".join(lines + [f"    Unknown node_key: {node_key}"]) + "\n"
-            # In focus mode, selected node is the center root; render one child level only.
-            for child in children.get(node_key, []) or []:
+            if not resolved_key:
+                return sanitize_mermaid_diagram(
+                    "\n".join(lines + [f"    Unknown node_key: {node_key}"]) + "\n"
+                )
+            for child in children.get(resolved_key, []) or []:
                 _emit_subtree(lines, child, 1, children, 1, emitted)
-            return "\n".join(lines) + "\n"
-        roots = children.get(None, [])
-        for r in roots:
+            return sanitize_mermaid_diagram("\n".join(lines) + "\n")
+        for r in operator_top_level_spoke_nodes(flat):
             _emit_subtree(lines, r, 1, children, 1, emitted)
-        return "\n".join(lines) + "\n"
+        return sanitize_mermaid_diagram("\n".join(lines) + "\n")
 
     if s == "full":
         roots = children.get(None, [])
         for r in roots:
             _emit_subtree(lines, r, 1, children, None, emitted)
-        return "\n".join(lines) + "\n"
+        return sanitize_mermaid_diagram("\n".join(lines) + "\n")
 
     if s == "subtree":
-        if not node_key or node_key not in by_key:
-            return "\n".join(lines + [f"    Unknown node_key: {node_key}"]) + "\n"
+        if not node_key or not resolved_key:
+            return sanitize_mermaid_diagram(
+                "\n".join(lines + [f"    Unknown node_key: {node_key}"]) + "\n"
+            )
         cap = depth if isinstance(depth, int) and depth >= 0 else 2
-        anchor = by_key[node_key]
+        anchor = by_key[resolved_key]
         _emit_subtree(lines, anchor, 1, children, cap, emitted)
-        return "\n".join(lines) + "\n"
+        return sanitize_mermaid_diagram("\n".join(lines) + "\n")
 
     if s == "path":
-        if not node_key or node_key not in by_key:
-            return "\n".join(lines + [f"    Unknown node_key: {node_key}"]) + "\n"
-        path = _path_to_root(node_key, by_key)
+        if not node_key or not resolved_key:
+            return sanitize_mermaid_diagram(
+                "\n".join(lines + [f"    Unknown node_key: {node_key}"]) + "\n"
+            )
+        path = _path_to_root(resolved_key, by_key)
         for i, node in enumerate(path):
             indent = " " * max(2 + 2 * (i + 1), 4)
             lines.append(f"{indent}{_mermaid_label(node)}")
-        return "\n".join(lines) + "\n"
+        return sanitize_mermaid_diagram("\n".join(lines) + "\n")
 
     lines.append(f"    Unknown scope: {scope}")
-    return "\n".join(lines) + "\n"
+    return sanitize_mermaid_diagram("\n".join(lines) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -630,26 +1002,28 @@ def apply_view_state_to_tree(
         view_state = {}
     node_path = [str(k).strip() for k in (view_state.get("node_path") or []) if str(k).strip()]
     selected = str(view_state.get("selected_node_key") or "").strip()
-    scope = str(view_state.get("view_scope") or "focus").strip().lower() or "focus"
-    if scope not in {"focus", "top", "subtree", "full", "path"}:
-        scope = "focus"
+    scope = str(view_state.get("view_scope") or "top").strip().lower() or "top"
     try:
         depth_cap = int(view_state.get("depth_cap") or 2)
     except Exception:
         depth_cap = 2
 
-    survivors = [k for k in node_path if k in by_key]
-    if selected and selected in by_key and selected not in survivors:
-        survivors.append(selected)
+    survivors: List[str] = []
+    for k in node_path:
+        resolved = resolve_node_key_in_snapshot(k, by_key)
+        if resolved and resolved not in survivors:
+            survivors.append(resolved)
+    selected_resolved = resolve_node_key_in_snapshot(selected, by_key) if selected else None
+    if selected_resolved and selected_resolved not in survivors:
+        survivors.append(selected_resolved)
     new_selected = survivors[-1] if survivors else None
     new_path: List[str] = []
     if new_selected:
         new_path = [n["node_key"] for n in _path_to_root(new_selected, by_key)]
-        if scope in {"top", "path"}:
-            scope = "focus"
+        if scope == "top":
+            scope = "subtree"
     else:
-        if scope in {"subtree", "path"}:
-            scope = "focus"
+        scope = "top"
 
     return {
         "node_path": new_path,

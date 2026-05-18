@@ -9,6 +9,7 @@ Follows the same patterns as hermes_state.SessionDB:
 
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -24,6 +25,7 @@ from .models import (
     ProjectExecute,
     ProjectReportArtifact,
     ProjectTemplate,
+    ReportingActivityStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,20 @@ def _eligible_for_pfm_run_inheritance(ex: ProjectExecute) -> bool:
     if ex.contributes_to_learning is False:
         return False
     return True
+
+
+def _has_valid_reporting_result(ex: ProjectExecute) -> bool:
+    if ex.valid_for_data_reporting_training is False:
+        return False
+    if ex.contributes_to_learning is False:
+        return False
+    if list(ex.results or []):
+        return True
+    if list(ex.reports or []):
+        return True
+    raw_status = getattr(ex, "status", "")
+    status = str(getattr(raw_status, "value", raw_status) or "").strip().lower()
+    return status == ExecutionStatus.COMPLETED.value
 
 
 _DEFAULT_DB_DIR = Path.home() / ".hermes" / "projects"
@@ -294,6 +310,33 @@ class ProjectStore:
         rows = self._conn.execute(query, params).fetchall()
         return [ProjectExecute.model_validate_json(r["data"]) for r in rows]
 
+    def list_execution_payloads(
+        self, template_id: Optional[str] = None, status: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Return raw execution JSON payloads without Pydantic validation."""
+        query = "SELECT data FROM executions WHERE 1=1"
+        params: List[Any] = []
+        if template_id:
+            query += " AND linked_template_id = ?"
+            params.append(template_id)
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC"
+        rows = self._conn.execute(query, params).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            data_text = str(row["data"] or "").strip()
+            if not data_text:
+                continue
+            try:
+                parsed = json.loads(data_text)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                out.append(parsed)
+        return out
+
     def get_execution(self, execution_id: str) -> Optional[ProjectExecute]:
         row = self._conn.execute(
             "SELECT data FROM executions WHERE id = ?", (execution_id,)
@@ -313,6 +356,10 @@ class ProjectStore:
             )
 
         self._execute_write(_write)
+        self.ensure_single_active_reporting_execution(
+            execution.linked_template_id,
+            preferred_execution_id=execution.id,
+        )
         from .pfm_run_number import ensure_template_run_numbers
 
         ensure_template_run_numbers(self, execution.linked_template_id)
@@ -373,9 +420,90 @@ class ProjectStore:
                 )
 
         self._execute_write(_write)
+        self.ensure_single_active_reporting_execution(template_id)
         if self.list_executions(template_id=template_id):
             self.rebuild_template_learning_from_latest_good_run(template_id)
         return True
+
+    def get_active_reporting_execution_id(self, template_id: str) -> Optional[str]:
+        if not template_id:
+            return None
+        for execution in self.list_executions(template_id=template_id):
+            if execution.reporting_activity_status == ReportingActivityStatus.ACTIVE:
+                return execution.id
+        return None
+
+    def ensure_single_active_reporting_execution(
+        self,
+        template_id: str,
+        preferred_execution_id: Optional[str] = None,
+        exclude_execution_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Keep exactly one reporting-active run per template when possible."""
+        if not template_id:
+            return None
+        runs = list(self.list_executions(template_id=template_id) or [])
+        if not runs:
+            return None
+
+        by_id = {run.id: run for run in runs if run.id}
+        preferred = by_id.get(str(preferred_execution_id or "").strip())
+        chosen_id = None
+        excluded = str(exclude_execution_id or "").strip()
+        if preferred and preferred.id != excluded:
+            chosen_id = preferred.id
+        if not chosen_id:
+            eligible = [
+                run
+                for run in runs
+                if run.id != excluded and _has_valid_reporting_result(run)
+            ]
+            if eligible:
+                chosen_id = eligible[0].id
+        if not chosen_id:
+            for run in runs:
+                if run.id != excluded:
+                    chosen_id = run.id
+                    break
+
+        for run in runs:
+            target = (
+                ReportingActivityStatus.ACTIVE
+                if chosen_id and run.id == chosen_id
+                else ReportingActivityStatus.CLOSED
+            )
+            if run.reporting_activity_status != target:
+                self.update_execution(run.id, reporting_activity_status=target)
+        return chosen_id
+
+    def set_execution_reporting_activity(
+        self,
+        execution_id: str,
+        *,
+        active: bool,
+    ) -> Optional[ProjectExecute]:
+        execution = self.get_execution(execution_id)
+        if not execution:
+            return None
+        if active:
+            self.update_execution(
+                execution_id,
+                reporting_activity_status=ReportingActivityStatus.ACTIVE,
+            )
+            self.ensure_single_active_reporting_execution(
+                execution.linked_template_id,
+                preferred_execution_id=execution_id,
+            )
+        else:
+            self.update_execution(
+                execution_id,
+                reporting_activity_status=ReportingActivityStatus.CLOSED,
+            )
+            self.ensure_single_active_reporting_execution(
+                execution.linked_template_id,
+                exclude_execution_id=execution_id,
+            )
+        return self.get_execution(execution_id)
 
     def set_execution_continuous_learning(
         self,
@@ -401,6 +529,10 @@ class ProjectStore:
             valid_for_data_reporting_training=True,
             learning_exclusion_reason=None,
             invalid_for_data_reporting_training_reason=None,
+        )
+        self.ensure_single_active_reporting_execution(
+            execution.linked_template_id,
+            preferred_execution_id=execution_id,
         )
         if execution.linked_template_id:
             self.rebuild_template_learning_from_latest_good_run(execution.linked_template_id)
@@ -430,6 +562,7 @@ class ProjectStore:
                 canonical_pfm_promotion_rationale=None,
             )
         self.remove_execution_learning_contribution(execution_id, execution.linked_template_id)
+        self.ensure_single_active_reporting_execution(execution.linked_template_id)
         self.rebuild_template_learning_from_latest_good_run(execution.linked_template_id)
         return updated
 
@@ -972,6 +1105,208 @@ class ProjectStore:
         if execution.status == ExecutionStatus.COMPLETED:
             self.publish_execution_artifacts_to_template(execution.id)
 
+    def _results_signature(
+        self, nodes: List[EadFmNodeRun]
+    ) -> List[tuple[str, str, str, str]]:
+        rows: List[tuple[str, str, str, str]] = []
+        for node in nodes or []:
+            node_key = str(getattr(node, "node_key", "") or "").strip()
+            if not node_key:
+                continue
+            title = str(getattr(node, "title", "") or "").strip()
+            parent = str(getattr(node, "parent_node_key", "") or "").strip()
+            status = getattr(node, "status", None)
+            status_text = str(getattr(status, "value", status) or "").strip().lower()
+            rows.append((node_key, title, parent, status_text))
+        rows.sort()
+        return rows
+
+    def _snapshot_signature(
+        self, snapshot: Optional[Dict[str, Any]]
+    ) -> List[tuple[str, str, str, str]]:
+        if not isinstance(snapshot, dict):
+            return []
+        rows: List[tuple[str, str, str, str]] = []
+        for item in snapshot.get("flat_nodes") or []:
+            if not isinstance(item, dict):
+                continue
+            node_key = str(item.get("node_key") or "").strip()
+            if not node_key:
+                continue
+            title = str(item.get("title") or "").strip()
+            parent = str(item.get("parent_node_key") or "").strip()
+            status_text = str(item.get("status") or "").strip().lower()
+            rows.append((node_key, title, parent, status_text))
+        rows.sort()
+        return rows
+
+    def _should_defer_snapshot_from_inherited_results(self, execution: ProjectExecute) -> bool:
+        """
+        Active runs seeded from an inherited baseline should keep reading that baseline
+        until they produce their own committed snapshot through explicit delivery/commit.
+        """
+        inherited_from = str(getattr(execution, "inherited_from_execution_id", "") or "").strip()
+        if not inherited_from or inherited_from == str(execution.id or "").strip():
+            return False
+        raw_status = getattr(execution, "status", "")
+        status = str(getattr(raw_status, "value", raw_status) or "").strip().lower()
+        return status in ("running", "pending")
+
+    def maybe_bootstrap_pfm_snapshot_from_results(self, execution_id: str) -> bool:
+        if not execution_id or self.has_committed_pfm_tree(execution_id):
+            return False
+        execution = self.get_execution(execution_id)
+        if not execution:
+            return False
+        if self._should_defer_snapshot_from_inherited_results(execution):
+            return False
+        out = self.persist_pfm_tree_from_execution_state(execution_id)
+        return bool(out.get("ok") and out.get("code") == "materialized")
+
+    def maybe_incremental_commit_from_execution_results(self, execution_id: str) -> bool:
+        sync_flag = str(os.getenv("EAD_PFM_SYNC_SNAPSHOT_FROM_RESULTS", "1") or "").strip().lower()
+        if sync_flag in ("0", "false", "off", "no"):
+            return False
+        execution = self.get_execution(execution_id)
+        if not execution:
+            return False
+        committed = self.get_committed_pfm_tree(execution_id)
+        if committed is None and self._should_defer_snapshot_from_inherited_results(execution):
+            return False
+        results = list(execution.results or [])
+        if not results:
+            return False
+        if committed and self._results_signature(results) == self._snapshot_signature(committed):
+            return False
+        out = self.persist_pfm_tree_from_execution_state(execution_id)
+        return bool(out.get("ok") and out.get("code") == "materialized")
+
+    def maybe_commit_pfm_snapshot_after_publish(self, execution_id: str) -> bool:
+        out = self.persist_pfm_tree_from_execution_state(execution_id)
+        return bool(out.get("ok") and out.get("code") == "materialized")
+
+    def _persist_snapshot_from_results(
+        self, execution: ProjectExecute, prev_snap: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        from .pfm_materialize import (
+            _all_parents_resolve,
+            _build_roots_payload,
+            _build_roots_payload_explicit_parents,
+        )
+        from .pfm_tree import SnapshotValidationError, snapshot_revision, validate_and_normalize_snapshot
+
+        nodes = list(execution.results or [])
+        if not nodes:
+            return {"ok": False, "code": "no_nodes", "message": "No run results available."}
+
+        if self._results_signature(nodes) == self._snapshot_signature(prev_snap):
+            version = int((prev_snap or {}).get("version") or 0)
+            return {
+                "ok": True,
+                "code": "no_changes",
+                "materialized": False,
+                "version": version,
+                "pfm_tree_version": version,
+            }
+
+        roots_payload = (
+            _build_roots_payload_explicit_parents(nodes)
+            if _all_parents_resolve(nodes)
+            else _build_roots_payload(nodes)
+        )
+        if not roots_payload:
+            return {"ok": False, "code": "empty_tree", "message": "Could not derive a tree from run results."}
+
+        prev_rev = snapshot_revision(prev_snap)
+        rev = prev_rev + 1 if prev_rev > 0 else 1
+        gen = self.get_pfm_generation_for_run(execution)
+
+        node_reports: List[Dict[str, str]] = []
+        seen: Set[str] = set()
+        for node in nodes:
+            nk = str(getattr(node, "node_key", "") or "").strip()
+            if not nk or nk in seen:
+                continue
+            seen.add(nk)
+            title = str(getattr(node, "title", "") or nk).strip()[:240]
+            node_reports.append(
+                {
+                    "node_key": nk,
+                    "title": title,
+                    "markdown": (
+                        f"# EAD Feature Map — {title}\n\n"
+                        f"Materialized from run results for execution `{execution.id}`.\n"
+                    ),
+                }
+            )
+
+        payload: Dict[str, Any] = {
+            "execution_id": execution.id,
+            "generated_at": int(time.time() * 1000),
+            "version": int(rev),
+            "roots": roots_payload,
+            "cross_cutting": [],
+            "node_reports": node_reports,
+        }
+        try:
+            snap, _, reps = validate_and_normalize_snapshot(
+                payload,
+                previous_version=prev_rev,
+            )
+        except SnapshotValidationError as exc:
+            return {
+                "ok": False,
+                "code": getattr(exc, "code", "snapshot_invalid"),
+                "message": str(exc),
+            }
+        snap["generation"] = int(gen)
+        snap["revision"] = int(rev)
+        snap["version"] = int(rev)
+        commit = self.replace_execution_pfm_tree(execution.id, snapshot=snap, node_reports=reps)
+        if not commit.get("committed"):
+            return {"ok": False, "code": "persist_failed", "message": str(commit.get("error") or "persist_failed")}
+        return {
+            "ok": True,
+            "code": "materialized",
+            "materialized": True,
+            "version": int(commit.get("pfm_tree_version") or rev),
+            **commit,
+        }
+
+    def persist_pfm_tree_from_execution_state(self, execution_id: str) -> Dict[str, Any]:
+        execution = self.get_execution(execution_id)
+        if not execution:
+            return {"ok": False, "code": "not_found", "message": "Execution not found"}
+
+        prev_snap = self.get_committed_pfm_tree(execution_id)
+        if list(execution.results or []):
+            return self._persist_snapshot_from_results(execution, prev_snap)
+
+        from .pfm_materialize import _collect_nodes_for_materialize, materialize_operator_pfm_snapshot
+
+        nodes = _collect_nodes_for_materialize(self, execution)
+        if not nodes:
+            return {"ok": False, "code": "no_nodes", "message": "No PFM nodes available to materialize."}
+
+        if prev_snap and self._results_signature(nodes) == self._snapshot_signature(prev_snap):
+            version = int(prev_snap.get("version") or 0)
+            return {
+                "ok": True,
+                "code": "no_changes",
+                "materialized": False,
+                "version": version,
+                "pfm_tree_version": version,
+            }
+
+        out = materialize_operator_pfm_snapshot(
+            self,
+            execution_id,
+            promote_template_canonical=False,
+        )
+        if out.get("ok") and "version" not in out:
+            out["version"] = int(out.get("pfm_tree_version") or 0)
+        return out
+
     # ------------------------------------------------------------------
     # Agent-authored PFM tree (commit_pfm_snapshot pipeline)
     # ------------------------------------------------------------------
@@ -1024,12 +1359,13 @@ class ProjectStore:
 
         from .pfm_delivery import (
             apply_delivery_baseline_to_snapshot,
+            compute_canonical_delivery_stamp,
             compute_delivery_stamp,
             restore_delivery_file_mtimes,
         )
 
         # Record agent on-disk delivery (filename + mtime) *before* we rewrite report/mindmap files.
-        pre_build_stamp = compute_delivery_stamp(execution.id)
+        pre_build_stamp = compute_canonical_delivery_stamp(execution.id)
 
         snapshot_payload = self._enrich_snapshot_versioning(execution, dict(snapshot), prev_snap)
         if not str(snapshot_payload.get("source_run_id") or "").strip():

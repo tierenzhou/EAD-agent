@@ -13,6 +13,9 @@ from typing import Optional
 
 from .pfm_artifacts import build_and_persist_pfm_artifacts
 from .pfm_tree import (
+    PFM_HIERARCHY_READABILITY_RULES,
+    PFM_NODE_TITLE_RULES,
+    PFM_PARENT_KEY_RULES,
     SnapshotValidationError,
     validate_and_normalize_snapshot,
 )
@@ -23,6 +26,8 @@ logger = logging.getLogger(__name__)
 _store: Optional[ProjectStore] = None
 
 _MIN_LOGIN_SUCCESS_SCREENSHOTS = 3
+# Cap PFM rows returned by read_ead_execution so payloads stay bounded.
+_READ_EXECUTION_RESULTS_MAX = 500
 
 
 def _login_checkpoint_title(title: str) -> bool:
@@ -69,6 +74,61 @@ def _get_store() -> ProjectStore:
     return _store
 
 
+def _normalize_pfm_snapshot_payload(raw: dict) -> dict:
+    """Map camelCase keys to the snake_case shape validate_and_normalize_snapshot expects.
+
+    Some model providers emit executionId / nodeReports / crossCutting even when
+    the logical payload matches the tree; without this, node_reports is seen as
+    empty and the commit fails with missing_node_reports (no mindmap in the UI).
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out = dict(raw)
+    for camel, snake in (
+        ("executionId", "execution_id"),
+        ("nodeReports", "node_reports"),
+        ("crossCutting", "cross_cutting"),
+        ("generatedAt", "generated_at"),
+    ):
+        if camel in out and snake not in out:
+            out[snake] = out.pop(camel)
+
+    def _norm_report_row(row: dict) -> dict:
+        d = dict(row)
+        if "nodeKey" in d and "node_key" not in d:
+            d["node_key"] = d.pop("nodeKey")
+        return d
+
+    nr = out.get("node_reports")
+    if isinstance(nr, list):
+        out["node_reports"] = [
+            _norm_report_row(r) if isinstance(r, dict) else r for r in nr
+        ]
+
+    def _norm_tree_node(node: dict) -> dict:
+        d = dict(node)
+        if "nodeKey" in d and "node_key" not in d:
+            d["node_key"] = d.pop("nodeKey")
+        if "parentNodeKey" in d and "parent_node_key" not in d:
+            d["parent_node_key"] = d.pop("parentNodeKey")
+        if "nodeId" in d and "node_id" not in d:
+            d["node_id"] = d.pop("nodeId")
+        ch = d.get("children")
+        if isinstance(ch, list):
+            d["children"] = [
+                _norm_tree_node(c) if isinstance(c, dict) else c for c in ch
+            ]
+        return d
+
+    for key in ("roots", "cross_cutting"):
+        lst = out.get(key)
+        if isinstance(lst, list):
+            out[key] = [
+                _norm_tree_node(n) if isinstance(n, dict) else n for n in lst
+            ]
+    return out
+
+
 def register_project_tools(store: Optional[ProjectStore] = None) -> None:
     global _store
     if store:
@@ -92,28 +152,52 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
             if entry.kind == "tool_result" and entry.thumbnail_url
         )
 
-        return json.dumps({
-            "id": execution.id,
-            "template_id": execution.linked_template_id,
-            "name": execution.name,
-            "target_url": execution.target_url,
-            "status": execution.status.value,
-            "progress_percentage": execution.progress_percentage,
-            "paused": execution.paused,
-            "steps_count": len(execution.steps),
-            "results_count": len(execution.results),
-            "screenshots_recorded": screenshots_recorded,
-            "executor_hint": execution.executor_hint,
-            "cancel_reason": execution.cancel_reason,
-        })
+        raw_results = list(execution.results or [])
+        truncated = len(raw_results) > _READ_EXECUTION_RESULTS_MAX
+        results_payload = [
+            r.model_dump(mode="json")
+            for r in raw_results[:_READ_EXECUTION_RESULTS_MAX]
+        ]
+
+        committed_tree = s.get_committed_pfm_tree(execution_id)
+        committed_version = (
+            int(committed_tree.get("version") or 0)
+            if isinstance(committed_tree, dict)
+            else 0
+        )
+
+        return json.dumps(
+            {
+                "id": execution.id,
+                "template_id": execution.linked_template_id,
+                "name": execution.name,
+                "target_url": execution.target_url,
+                "status": execution.status.value,
+                "progress_percentage": execution.progress_percentage,
+                "paused": execution.paused,
+                "steps_count": len(execution.steps),
+                "results_count": len(raw_results),
+                "results": results_payload,
+                "results_truncated": truncated,
+                "committed_pfm_tree_version": committed_version,
+                "screenshots_recorded": screenshots_recorded,
+                "executor_hint": execution.executor_hint,
+                "cancel_reason": execution.cancel_reason,
+            },
+            ensure_ascii=False,
+        )
 
     registry.register(
         name="read_ead_execution",
         toolset="project",
         schema={
             "type": "object",
-            "description": "Read the current status and results of an EAD project execution. "
-                           "Use this to check progress, view step results, and see screenshots recorded.",
+            "description": "Read the current status of an EAD project execution plus the persisted "
+                           "PFM baseline in `results` (inherited nodes, hierarchy fields). "
+                           "Use this before commit_pfm_snapshot to align roots/node_key with "
+                           "`results` and to decide which node_reports keys can be omitted when "
+                           "node_ead_report artifacts already exist. `committed_pfm_tree_version` is "
+                           "0 until the first successful commit_pfm_snapshot for this execution.",
             "properties": {
                 "execution_id": {
                     "type": "string",
@@ -582,17 +666,18 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
         reports = build_and_persist_pfm_artifacts(execution)
         s.update_execution(execution_id, reports=reports)
         s.sync_execution_pfm_artifacts_from_state(execution_id)
-        from projects.pfm_materialize import ensure_committed_pfm_snapshot_after_artifact_delivery
-
-        snapshot_result = ensure_committed_pfm_snapshot_after_artifact_delivery(
-            s, execution_id, promote_template_canonical=False
-        )
+        try:
+            s.maybe_commit_pfm_snapshot_after_publish(execution_id)
+        except Exception:
+            logger.exception(
+                "[projects] maybe_commit_pfm_snapshot_after_publish failed for %s",
+                execution_id,
+            )
         return json.dumps(
             {
                 "published": True,
                 "execution_id": execution_id,
                 "reports": [r.model_dump() for r in reports],
-                "pfm_snapshot": snapshot_result,
             }
         )
 
@@ -603,7 +688,9 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
             "type": "object",
             "description": (
                 "Generate and publish PFM mindmap/report artifacts for the current "
-                "EAD project execution, then attach them to the run."
+                "EAD project execution, then attach them to the run. If no agent-authored "
+                "pfm-tree exists yet, the server may auto-commit v1 from results and "
+                "progress-log PFM nodes so the operator mindmap can render."
             ),
             "properties": {
                 "execution_id": {
@@ -618,6 +705,7 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
     )
 
     def _commit_pfm_snapshot(args: dict, context: dict = None) -> str:
+        args = _normalize_pfm_snapshot_payload(args if isinstance(args, dict) else {})
         s = _get_store()
         execution_id = str(args.get("execution_id") or "").strip()
         if not execution_id:
@@ -626,48 +714,40 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
         if not execution:
             return json.dumps({"error": f"Execution {execution_id} not found", "committed": False})
 
+        previous_version = 0
         prev_snap: Optional[dict] = None
-        previous_revision = 0
         try:
             from .pfm_tree import (
                 PFM_TREE_ARTIFACT_KEY,
                 collect_node_report_markdown_by_key,
                 committed_tree_node_keys,
-                snapshot_finalized,
-                snapshot_revision,
             )
 
             prev_art = s.get_execution_pfm_artifact(execution_id, PFM_TREE_ARTIFACT_KEY)
             if isinstance(prev_art, dict):
                 prev_snap = prev_art.get("snapshot")
                 if isinstance(prev_snap, dict):
-                    previous_revision = snapshot_revision(prev_snap)
+                    previous_version = int(prev_snap.get("version") or 0)
         except Exception:
-            previous_revision = 0
+            previous_version = 0
             prev_snap = None
 
-        if snapshot_finalized(prev_snap):
-            return json.dumps(
-                {
-                    "committed": False,
-                    "error": "PFM is finalized; no further revisions are allowed on this run.",
-                    "code": "pfm_finalized",
-                }
-            )
-
-        generation, revision = s.compute_next_pfm_versioning(execution, prev_snap)
-
-        carry_source_keys = committed_tree_node_keys(prev_snap if isinstance(prev_snap, dict) else None)
-        carry_library = (
-            collect_node_report_markdown_by_key(s, execution_id) if carry_source_keys else {}
-        )
+        carry_from_tree = committed_tree_node_keys(prev_snap if isinstance(prev_snap, dict) else None)
+        disk_reports = collect_node_report_markdown_by_key(s, execution_id)
+        if previous_version > 0:
+            carry_source_keys = carry_from_tree
+            carry_library = {k: disk_reports[k] for k in carry_from_tree if k in disk_reports}
+        else:
+            # First snapshot (v1): reuse any node_ead_report rows already stored for this
+            # execution (e.g. inheritance seed) so the agent can publish the mindmap sooner
+            # without regenerating Markdown for every inherited node.
+            carry_source_keys = set(disk_reports.keys())
+            carry_library = dict(disk_reports)
 
         try:
             snapshot, _flat_runs, report_payloads = validate_and_normalize_snapshot(
                 args,
-                generation=generation,
-                revision=revision,
-                previous_revision=previous_revision,
+                previous_version=previous_version,
                 report_carry_source_keys=carry_source_keys,
                 report_carry_library=carry_library,
             )
@@ -710,15 +790,13 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
             {
                 "committed": True,
                 "execution_id": execution_id,
-                "pfm_generation": int(snapshot.get("generation") or 0),
-                "pfm_revision": int(snapshot.get("revision") or snapshot.get("version") or 0),
-                "pfm_tree_version": int(snapshot.get("revision") or snapshot.get("version") or 0),
+                "pfm_tree_version": int(snapshot.get("version") or 0),
                 "generated_at": int(snapshot.get("generated_at") or 0),
                 "node_count": len(snapshot.get("flat_nodes") or []),
                 "report_count": len(report_payloads),
                 "incoming_report_count": len(incoming_keys),
                 "carried_forward_report_count": carried_report_count,
-                "previous_revision": previous_revision,
+                "previous_version": previous_version,
                 "reports_attached": list((result or {}).get("reports") or []) or None,
             }
         )
@@ -729,11 +807,20 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
         schema={
             "type": "object",
             "description": (
-                "Replace the canonical PFM tree for this execution with the entire "
-                "agent-authored hierarchy plus a Markdown EAD report for every node. "
-                "Call this roughly every 5 minutes during exploration and once at finalize. "
-                "The committed snapshot is the single source of truth for the mindmap, "
-                "persistence, and inheritance into future runs."
+                "**TOP PRIORITY — operator mindmap:** replace the canonical PFM tree for this execution "
+                "with the agent-authored hierarchy plus Markdown EAD reports. Publish **version 1** as soon "
+                "as a workable draft exists (partial is OK), then about every **2–3 minutes** while exploring "
+                "and once at finalize. Tree must be multi-level with at most 15 direct children per parent "
+                "(group UI columns/filters into EAD reports, not mindmap leaves). On the first commit, "
+                "node_reports may omit keys that already have node_ead_report artifacts on this run "
+                "(inheritance); those are carried forward. "
+                "The committed snapshot is the single source of truth for the mindmap, persistence, "
+                "and inheritance into future runs. "
+                + PFM_HIERARCHY_READABILITY_RULES.replace("\n", " ")
+                + " "
+                + PFM_PARENT_KEY_RULES.replace("\n", " ")
+                + " "
+                + PFM_NODE_TITLE_RULES.replace("\n", " ")
             ),
             "properties": {
                 "execution_id": {
@@ -743,8 +830,8 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                 "version": {
                     "type": "integer",
                     "description": (
-                        "Deprecated — the gateway assigns template generation (e.g. 10) and "
-                        "within-run revision (Rev 1, 2, …). Omit this field."
+                        "Monotonic snapshot version. Must be strictly greater than the "
+                        "previously committed version for this execution. Start at 1."
                     ),
                 },
                 "generated_at": {
@@ -754,7 +841,9 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                 "roots": {
                     "type": "array",
                     "description": (
-                        "Top-level PFM nodes (product/system domains) with recursive children. "
+                        "PFM tree under one null-parent hub; all modules use parent_node_key = hub node_key "
+                        "(never null on modules). Operator UI center is the run name; first screen shows hub children. "
+                        "At each parent, at most 15 direct children — add intermediate levels for larger areas. "
                         "Each TreeNode has node_key, title, parent_node_key (must match the "
                         "actual parent), level, type, status, description, and optional "
                         "children[]. node_key must be unique across the snapshot and, for "
@@ -773,14 +862,14 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                 "node_reports": {
                     "type": "array",
                     "description": (
-                        "Detailed Markdown EAD reports keyed by node_key (standard sections: Node "
-                        "Summary, Features with test cases and evidence, then Explore and improve for "
-                        "future exploration). On the **first** snapshot for this execution, include "
-                        "one entry with non-empty markdown for **every** node in the tree. On later "
-                        "snapshots, send reports only for new or materially updated nodes; unchanged "
-                        "node_key values are carried forward automatically. Always include full "
-                        "markdown for brand-new node_key values. Do not include node_key values that "
-                        "are not in roots/cross_cutting."
+                        "Markdown EAD reports keyed by node_key. On the **first** snapshot for this "
+                        "execution, include one entry with non-empty markdown for **every** node in "
+                        "the tree. On later snapshots (after at least one successful commit), you may "
+                        "send reports **only for new, renamed, or materially updated** nodes; the "
+                        "gateway automatically **carries forward** prior Markdown for unchanged "
+                        "node_key values from the last committed tree using saved node_ead_report "
+                        "artifacts. Always include full markdown for any brand-new node_key. "
+                        "Do not include node_key values that are not in roots/cross_cutting."
                     ),
                     "items": {
                         "type": "object",
@@ -793,7 +882,7 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                     },
                 },
             },
-            "required": ["execution_id", "roots", "node_reports"],
+            "required": ["execution_id", "version", "roots", "node_reports"],
         },
         handler=_commit_pfm_snapshot,
         description="Commit the entire agent-authored PFM tree plus per-node EAD reports",

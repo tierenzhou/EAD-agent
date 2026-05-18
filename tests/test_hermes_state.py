@@ -108,6 +108,15 @@ class TestMessageStorage:
         session = db.get_session("s1")
         assert session["message_count"] == 2
 
+    def test_get_messages_page_returns_ordered_slice(self, db):
+        db.create_session(session_id="s1", source="cli")
+        for i in range(8):
+            db.append_message("s1", role="user", content=f"m{i}")
+
+        page = db.get_messages_page("s1", limit=3, offset=2)
+        assert len(page) == 3
+        assert [m["content"] for m in page] == ["m2", "m3", "m4"]
+
     def test_tool_response_does_not_increment_tool_count(self, db):
         """Tool responses (role=tool) should not increment tool_call_count.
 

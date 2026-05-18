@@ -1920,7 +1920,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 from projects.executor import ProjectExecutor
 
                 self._agent_pool = SessionAgentPool(adapter=self)
-                self._chat_control_handlers = ChatControlHandlers(agent_pool=self._agent_pool)
+                self._chat_control_handlers = ChatControlHandlers(
+                    agent_pool=self._agent_pool,
+                    project_store=getattr(self, "_project_store", None),
+                )
                 self._chat_control_handlers.register_routes(self._app)
                 logger.info("[api_server] Chat control API endpoints registered (with agent pool)")
                 if hasattr(self, "_project_store") and self._project_handlers:

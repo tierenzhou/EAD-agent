@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from projects.api import ProjectHandlers
 from projects.models import ExecutionStatus, ProjectExecute
@@ -14,6 +14,7 @@ class _Req:
     def __init__(self, execution_id: str, body_exists: bool = False, body: dict | None = None) -> None:
         self.match_info = {"execution_id": execution_id}
         self.body_exists = body_exists
+        self.can_read_body = body_exists
         self._body = body or {}
 
     async def json(self) -> dict:
@@ -66,3 +67,28 @@ def test_refresh_default_completed_run_prefers_agent_commit_path_when_session_ex
     assert payload["executionId"] == "exec-2"
     executor.request_pfm_snapshot_refresh.assert_called_once_with("exec-2")
 
+
+
+def test_refresh_from_delivery_uses_delivery_gate():
+    store = MagicMock()
+    execution = ProjectExecute(
+        id="exec-1",
+        linked_template_id="tpl-1",
+        name="Run 1",
+        status=ExecutionStatus.COMPLETED,
+    )
+    store.get_execution.return_value = execution
+
+    executor = MagicMock()
+    handlers = ProjectHandlers(store=store, executor=executor)
+    req = _Req("exec-1", body_exists=True, body={"refresh_from_delivery": True})
+
+    with patch("projects.pfm_refresh.try_refresh_pfm_from_delivery") as mock_refresh:
+        mock_refresh.return_value = {"ok": True, "code": "no_changes"}
+        resp = asyncio.run(handlers.handle_post_pfm_request_snapshot(req))
+
+    assert resp.status == 200
+    payload = json.loads(resp.text)
+    assert payload["code"] == "no_changes"
+    mock_refresh.assert_called_once()
+    executor.request_pfm_snapshot_refresh.assert_not_called()

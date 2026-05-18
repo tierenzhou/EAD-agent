@@ -21,6 +21,7 @@ from .models import (
     TestCaseRun,
     TestCaseStepRunStatus,
 )
+from .pfm_tree import strip_pfm_node_display_title
 
 
 def reports_root_dir() -> Path:
@@ -278,24 +279,33 @@ def derive_pfm_nodes_from_ascii_tree_text(content: str) -> List[EadFmNodeRun]:
 
 def derive_pfm_nodes_from_mermaid_mindmap_text(content: str) -> List[EadFmNodeRun]:
     """
-    Recover ``EadFmNodeRun`` rows from Mermaid ``mindmap`` text (``root((...))`` and ``(...)`` nodes).
+    Recover ``EadFmNodeRun`` rows from Mermaid-style mindmap text.
 
-    Lines without leading node shapes (e.g. ``Status:`` continuations) are skipped.
+    Supports:
+    - Canonical Mermaid shapes: ``root((...))``, ``((...))``, ``(...)``
+    - Plain indented labels (e.g. ``Authentication``)
+    - Optional stable key suffix: ``[key:node_key]``
+    - Optional header line: ``EAD Feature Map``
     """
     runs: List[EadFmNodeRun] = []
     stack: List[tuple[int, str]] = []
+    used_keys: set[str] = set()
 
     for raw in content.splitlines():
         stripped = raw.strip()
         if not stripped or stripped.startswith("```"):
+            continue
+        if stripped.lower() == "ead feature map":
             continue
         s = raw.rstrip("\n")
         leading = len(s) - len(s.lstrip(" "))
         rest = s.lstrip(" ")
         if rest == "mindmap":
             continue
-        if not (rest.startswith("(") or rest.startswith("root((")):
-            continue
+        key_m = re.search(r"\[key:([^\]]+)\]\s*$", rest, re.IGNORECASE)
+        explicit_key = str(key_m.group(1) if key_m else "").strip()
+        if key_m:
+            rest = rest[: key_m.start()].rstrip()
         label: Optional[str] = None
         m = re.search(r"root\(\((.+?)\)\)", rest)
         if m:
@@ -308,6 +318,8 @@ def derive_pfm_nodes_from_mermaid_mindmap_text(content: str) -> List[EadFmNodeRu
                 m3 = re.match(r"\((.+?)\)", rest)
                 if m3:
                     label = m3.group(1).strip()
+                else:
+                    label = rest.strip()
         if not label:
             continue
         if "[" in label and "]" in label:
@@ -316,10 +328,10 @@ def derive_pfm_nodes_from_mermaid_mindmap_text(content: str) -> List[EadFmNodeRu
         while stack and stack[-1][0] >= depth:
             stack.pop()
         parent_key = stack[-1][1] if stack else None
-        nk = _slug_node_key(label, f"mm-{len(runs)}")
-        used_keys = {r.node_key for r in runs}
+        nk = explicit_key or _slug_node_key(label, f"mm-{len(runs)}")
         if nk in used_keys:
             nk = f"{nk}-{len(runs)}"
+        used_keys.add(nk)
         runs.append(
             EadFmNodeRun(
                 node_id=nk,

@@ -24,6 +24,23 @@ from typing import Any, Dict, List, Optional, Union
 _RUN_PURPOSE_ALLOWED = frozenset({"live_app_learning", "live_app_testing", "document_analysis"})
 _EVIDENCE_SOURCE_ALLOWED = frozenset({"live_app", "document", "hybrid"})
 
+# Executor progress extraction skips messages that start with this marker.
+EAD_RUN_ACK_MARKER = "[EAD-RUN-ACK:v1]"
+
+_EXPLORE_TYPE_LABELS: Dict[str, str] = {
+    "pfm-full": "Full PFM map (features and test cases)",
+    "pfm-spec": "PFM map with features and functional specs",
+    "website": "Website exploration and content gathering",
+    "other": "Custom exploration goal",
+}
+
+
+def _explore_type_label(explore_type: Optional[str]) -> str:
+    key = (explore_type or "").strip()
+    if not key:
+        return "PFM discovery (default)"
+    return _EXPLORE_TYPE_LABELS.get(key, key)
+
 
 def _coerce_request_bool(value: Any) -> Optional[bool]:
     if value is None:
@@ -86,10 +103,11 @@ def _parse_execution_learning_metadata(body: Dict[str, Any]) -> Union[Dict[str, 
     }
 
 
-EAD_RUN_ACK_MARKER = "[EAD-RUN-ACK:v1]"
-
-
-def _execution_ack_message(execution: ProjectExecute) -> str:
+def _execution_ack_message(
+    execution: ProjectExecute,
+    *,
+    template: Optional[ProjectTemplate] = None,
+) -> str:
     purpose = execution.run_purpose or "live_app_learning"
     evidence = execution.evidence_source or "live_app"
     learning = (
@@ -98,46 +116,155 @@ def _execution_ack_message(execution: ProjectExecute) -> str:
         else "will not update the template learning index"
     )
     target = (execution.target_url or "").strip() or "the configured target"
+    run_name = (execution.name or "this Explore run").strip()
+    template_name = (template.name if template else "").strip()
+    about = (execution.description or "").strip()
+    if not about and template is not None:
+        about = (template.description or "").strip()
+    explore = _explore_type_label(execution.explore_type or (template.explore_type if template else None))
+    budget = execution.time_budget_minutes
+    budget_line = f"{int(budget)} minutes" if budget else "not set"
+    about_block = f"\n### What this run is about\n\n{about}\n\n" if about else ""
+    template_line = f"- Project template: **{template_name}**\n" if template_name else ""
     return (
         f"{EAD_RUN_ACK_MARKER}\n\n"
         f"## Run Introduction\n\n"
-        f"I have received the assignment for **{execution.name or 'this Explore run'}** and I am starting now.\n\n"
+        f"I have received the assignment for **{run_name}** and I am starting now.\n\n"
+        f"{about_block}"
+        f"{template_line}"
+        f"- Explore focus: {explore}\n"
         f"- Purpose: `{purpose}`\n"
         f"- Evidence focus: `{evidence}`\n"
         f"- Learning mode: {learning}\n"
+        f"- Time budget: {budget_line}\n"
         f"- Target: {target}\n\n"
         "First I will complete the login/initialization phase. After login is confirmed, "
         "I will begin PFM discovery and report meaningful milestones with evidence.\n\n"
+        "I will wait for your messages in chat when you need to steer login or priorities. "
+        "Until then I will work through initialization and discovery on the schedule above.\n\n"
         "Login evidence: I will attach at least 3 screenshots (site URL identity, login step, post-login view) "
         "in report_running_step.thumbnail_urls before declaring login success."
     )
 
 
-def _execution_scope_message(execution: ProjectExecute) -> str:
+def _execution_boundary_message(execution: ProjectExecute) -> str:
     target = (execution.target_url or "").strip() or "the configured target URL"
-    template_id = (execution.linked_template_id or "").strip()
-    run_name = (execution.name or execution.id).strip()
     return "\n".join(
         [
-            "RUN SCOPE (this session only):",
+            "HARD PROJECT TEMPLATE BOUNDARY:",
             f"- Execution ID: {execution.id}.",
-            f"- Template ID: {template_id}.",
-            f"- Run name: {run_name}.",
+            f"- Template ID: {execution.linked_template_id}.",
+            f"- Run name: {execution.name or execution.id}.",
             f"- Target URL: {target}.",
-            "- This project template is independent from every other template.",
-            "- Do not use global memory, memories from other templates, previous chat sessions, or facts from any different target as evidence.",
+            "- Each project template is independent from all other templates.",
+            "- Do not use global memory, another template's runs, another session, or another target as evidence.",
             "- Use only this run's live observations plus explicitly injected same-template learning context.",
-            "- If you remember SWAdmin, employee portal, team portal, user manager, system setting, or any other prior project, ignore it unless it is discovered again from this exact target during this run.",
-            "- Start from the Target URL above. Do not navigate to a remembered URL or subdomain unless the Target URL itself redirects there and you report that redirect as live evidence.",
-            "- PFM nodes, EAD node reports, screenshots, and training data must describe only this execution and this template.",
-            "- Every project tool call must use the Execution ID above.",
+            "- Start from the Target URL. Do not navigate to remembered URLs or subdomains unless the Target URL itself redirects there.",
+            "- If remembered information conflicts with this boundary, ignore the remembered information and report only live evidence.",
         ]
     )
 
 
-def _execution_boundary_message(execution: ProjectExecute) -> str:
-    """Backward-compatible alias for session bootstrap."""
-    return _execution_scope_message(execution)
+def _template_isolation_block(template: ProjectTemplate, target_url: str) -> str:
+    return "\n".join(
+        [
+            "## Template Isolation Rules",
+            f"- Current template ID: `{template.id}`.",
+            f"- Current template name: `{template.name}`.",
+            f"- Current target URL: `{target_url}`.",
+            "- Hard rule: no global knowledge and no cross-template memory. Each project template is independent.",
+            "- Do not use facts from other project templates, previous runs, or persistent memory as current evidence unless they appear in the Template Learning Context above and belong to this exact template.",
+            "- If persistent memory mentions a different target, subdomain, template, or application, ignore it unless this run rediscovers it from the current target.",
+            "- Start from the current target URL. If the browser redirects to a different domain or subdomain, report the redirect as a fresh observation; do not assume it means this run is another project.",
+            "- Build the PFM and node EAD reports from evidence collected in this run plus same-template inherited context only.",
+        ]
+    )
+
+
+def _assemble_execution_ai_prompt(
+    store: ProjectStore,
+    template: ProjectTemplate,
+    user_prompt: str,
+    target_url: str,
+    *,
+    include_learning_context: bool,
+) -> str:
+    """Build execution ai_prompt. Learning context is deferred to bootstrap when include_learning_context=False."""
+    base_ai_prompt = str(user_prompt or template.ai_prompt or "").strip()
+    if include_learning_context:
+        inherited_context = store.build_template_learning_context(template.id)
+        if inherited_context:
+            base_ai_prompt = "\n\n".join(
+                [
+                    base_ai_prompt,
+                    "## Template Learning Context",
+                    (
+                        "This same-template PFM context is locked until login succeeds. "
+                        "Do not read, summarize, mention, display, or rely on it before the login checkpoint "
+                        "reports login_phase_status=success."
+                    ),
+                    inherited_context,
+                    (
+                        "Instruction after login only: reuse these prior PFM mindmap/node-report findings "
+                        "as a starting hypothesis, then improve or correct them with new evidence."
+                    ),
+                ]
+            ).strip()
+    return "\n\n".join(
+        [
+            part
+            for part in [base_ai_prompt, _template_isolation_block(template, target_url)]
+            if part
+        ]
+    ).strip()
+
+
+def enrich_execution_ai_prompt_with_learning(store: ProjectStore, execution_id: str) -> None:
+    """Append template learning context during deferred bootstrap (not on POST /executions/run)."""
+    execution = store.get_execution(execution_id)
+    if not execution:
+        return
+    template = store.get_template(execution.linked_template_id)
+    if not template:
+        return
+    target_url = str(execution.target_url or template.target_url or "").strip()
+    user_prompt = str(execution.ai_prompt or template.ai_prompt or "").strip()
+    full_prompt = _assemble_execution_ai_prompt(
+        store,
+        template,
+        user_prompt,
+        target_url,
+        include_learning_context=True,
+    )
+    store.update_execution(execution_id, ai_prompt=full_prompt)
+
+
+def _execution_list_item_dict(
+    execution: ProjectExecute | Dict[str, Any],
+    store: Optional["ProjectStore"] = None,
+) -> Dict[str, Any]:
+    """Lightweight execution row for list API (avoids shipping full progress logs for every run)."""
+    # Avoid serializing then discarding large nested payloads (progress_log/results),
+    # which can block the gateway main loop on large/active runs.
+    if isinstance(execution, dict):
+        raw = dict(execution)
+    else:
+        raw = execution.model_dump(mode="json", exclude={"progress_log", "results"})
+    raw["progress_log"] = []
+    raw["results"] = []
+    prompt = str(raw.get("ai_prompt") or "")
+    if len(prompt) > 800:
+        raw["ai_prompt"] = prompt[:800] + "\n...(truncated in list view)"
+    if store is not None and not isinstance(execution, dict):
+        raw.update(store.resolve_pfm_lineage_context(execution))
+    return _to_camel_dict(raw)
+
+
+def _execution_detail_dict(store: "ProjectStore", execution: ProjectExecute) -> Dict[str, Any]:
+    """Full execution payload for GET + UI, including PFM lineage flags."""
+    raw = json.loads(execution.model_dump_json())
+    raw.update(store.resolve_pfm_lineage_context(execution))
+    return _to_camel_dict(raw)
 
 try:
     from aiohttp import web
@@ -153,9 +280,15 @@ from projects.models import (
     ProjectAuthMode,
     ProjectExecute,
     ProjectTemplate,
+    ReportingActivityStatus,
 )
 from projects.store import ProjectStore
 from projects.pfm_artifacts import report_file_path, resolve_pfm_nodes_for_mindmap
+from projects.pfm_tree import (
+    PFM_HIERARCHY_READABILITY_RULES,
+    PFM_NODE_TITLE_RULES,
+    PFM_PARENT_KEY_RULES,
+)
 
 logger = logging.getLogger(__name__)
 _IMAGE_PATH_RE = re.compile(r"(?:MEDIA:)?(?P<path>/[^\s`\"']+\.(?:png|jpe?g|gif|webp))", re.IGNORECASE)
@@ -176,38 +309,103 @@ def _build_phase1_canonical_baseline_message(
     execution: ProjectExecute,
 ) -> Optional[str]:
     """
-    Minimal inherited snapshot pointer when PFM skills are not available for this template.
-    Full map/reports live in skill files when present; this avoids duplicating them in chat.
+    One authoritative Phase-1 baseline for agents: persisted PFM nodes, mindmap excerpt,
+    and per-node EAD reports so Initialization (post-login) can reconcile accurately.
     """
     nodes = resolve_pfm_nodes_for_mindmap(execution)
     artifacts = store.list_execution_pfm_artifacts(execution.id)
-    report_count = sum(
-        1
-        for art in artifacts
-        if str(art.get("artifact_type") or "") == "node_ead_report"
-    )
-    inherited_from = str(execution.inherited_from_execution_id or "").strip()
-    if not nodes and report_count == 0 and not inherited_from:
+    committed_tree = store.get_committed_pfm_tree(execution.id)
+
+    mind_excerpt = ""
+    for art in artifacts:
+        if str(art.get("artifact_type") or "") == "pfm_mindmap":
+            mc = str(art.get("content") or "").strip()
+            if mc:
+                me = mc[:4500]
+                if len(mc) > 4500:
+                    me += "\n... [mindmap truncated] ..."
+                mind_excerpt = me
+                break
+
+    ereports_lines: List[str] = []
+    for art in artifacts:
+        if str(art.get("artifact_type") or "") != "node_ead_report":
+            continue
+        title = str(art.get("title") or art.get("artifact_key") or "EAD report").strip()
+        nk = str(art.get("node_key") or "").strip()
+        raw_ex = art.get("excerpt") if art.get("excerpt") is not None else art.get("content")
+        excerpt = str(raw_ex or "")[:900].strip().replace("\n", " ")
+        ereports_lines.append(f"- **{title}** (`node_key`: `{nk or 'n/a'}`): {excerpt}")
+
+    if not nodes and not mind_excerpt and not ereports_lines:
         return None
 
-    lines: List[str] = [
+    chunks: List[str] = [
         _PFM_PHASE1_BASELINE_MARKER,
         "",
-        f"- Execution ID: `{execution.id}`",
+        f"- **Execution ID:** `{execution.id}`",
     ]
-    if inherited_from:
-        lines.append(f"- Inherited from prior run: `{inherited_from}`")
-    lines.append(f"- PFM nodes available: {len(nodes)}")
-    lines.append(f"- Node reports available: {report_count}")
-    lines.extend(
+    if isinstance(committed_tree, dict):
+        tree_version = int(committed_tree.get("version") or 0)
+        generated_at_ms = int(committed_tree.get("generated_at") or 0)
+        chunks.append(f"- **PFM tree version:** `v{tree_version}`")
+        if generated_at_ms:
+            chunks.append(f"- **PFM tree generated_at (ms):** `{generated_at_ms}`")
+    else:
+        chunks.append("- **PFM tree version:** `none` (no committed snapshot yet)")
+    if execution.inherited_from_execution_id:
+        chunks.append(
+            f"- **Inherited / seeded from execution:** `{execution.inherited_from_execution_id}`"
+        )
+    chunks.extend(
         [
             "",
-            "No PFM skill files are loaded for this template yet.",
-            "Call **read_ead_execution** for this Execution ID, then verify inherited structure on the live app.",
-            "Treat inherited data as a hypothesis to confirm—not as final evidence for this run.",
+            "**Phase 1 (post-login Initialization) commitments:**",
+            "- This snapshot is authoritative **prior** product-structure state for this Execution ID ",
+            "(not live evidence yet). Confirm with targeted navigation and screenshots.",
+            "- Call **read_ead_execution** for this Execution ID and reconcile counters, artifact links, ",
+            "and `results[]` against this baseline and the listed Node EAD reports.",
+            "- In Initialization step 2, summarize this baseline as a concise mindmap-style outline ",
+            "(including coverage of **each** EAD note report listed here), cite gaps vs the live ",
+            "target URL, then set `initialization_review_status=success` and `ready_to_explore=true`.",
+            "",
+            PFM_HIERARCHY_READABILITY_RULES,
+            PFM_PARENT_KEY_RULES,
+            PFM_NODE_TITLE_RULES,
+            "",
         ]
     )
-    return "\n".join(lines).strip()
+    if nodes:
+        chunks.append(f"### Canonical PFM nodes ({len(nodes)})")
+        chunks.append("| # | Title | Node key | Status |")
+        chunks.append("|---|--------|----------|--------|")
+        for i, n in enumerate(nodes[:120], start=1):
+            t = str(n.title or "").replace("|", " ").strip()[:120]
+            k = str(n.node_key or "").replace("|", " ").strip()[:100]
+            st = getattr(n.status, "value", None) if n.status is not None else n.status
+            st_txt = str(st if st is not None else "").replace("|", " ")
+            chunks.append(f"| {i} | {t} | `{k}` | {st_txt} |")
+        if len(nodes) > 120:
+            chunks.append("")
+            chunks.append(f"... truncated: {len(nodes) - 120} more nodes omitted from snapshot.")
+        chunks.append("")
+    if ereports_lines:
+        chunks.append("### Persisted Node EAD reports (must appear in Initialization outline)")
+        chunks.extend(ereports_lines[:40])
+        if len(ereports_lines) > 40:
+            chunks.append(f"... +{len(ereports_lines) - 40} more reports not listed here.")
+        chunks.append("")
+    if mind_excerpt:
+        chunks.append("### Persisted Mermaid mindmap excerpt (structure reference)")
+        chunks.append("```")
+        chunks.append(mind_excerpt)
+        chunks.append("```")
+
+    body = "\n".join(chunks).strip()
+    max_len = 14_800
+    if len(body) > max_len:
+        body = body[: max_len - 40].rstrip() + "\n\n... [snapshot truncated]"
+    return body
 
 
 def _try_inject_inherited_pfm_mindmap_cache(
@@ -264,7 +462,10 @@ def _hermes_home() -> Path:
 
 def _resolve_local_image_path(path_text: str) -> Path:
     src = Path(path_text).expanduser()
-    if src.exists():
+    try:
+        if src.exists():
+            return src
+    except OSError:
         return src
     if src.is_absolute() or src.name != path_text:
         return src
@@ -273,8 +474,11 @@ def _resolve_local_image_path(path_text: str) -> Path:
         _hermes_home() / "browser_screenshots",
     ):
         candidate = directory / src.name
-        if candidate.exists():
-            return candidate
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            continue
     return src
 
 
@@ -371,7 +575,13 @@ def _materialize_local_image_as_report(execution_id: str, image_path: str) -> Op
     path_text = str(image_path or "").strip()
     if not path_text:
         return None
-    if "\n" in path_text or "\r" in path_text or len(path_text) > 2048:
+    if (
+        "\n" in path_text
+        or "\r" in path_text
+        or "\\n" in path_text
+        or "\\r" in path_text
+        or len(path_text) > 2048
+    ):
         return None
     src = _resolve_local_image_path(path_text)
     if not _is_usable_local_image(src):
@@ -505,6 +715,7 @@ class ProjectHandlers:
     def __init__(self, store: Optional[ProjectStore] = None, executor=None):
         self._store = store or ProjectStore()
         self._executor = executor
+        self._fmr_sync_inflight: set[str] = set()
 
     def _schedule_execution_bootstrap(self, execution_id: str) -> None:
         from projects.run_bootstrap import run_execution_bootstrap
@@ -522,6 +733,31 @@ class ProjectHandlers:
             )
             return
         loop.create_task(run_execution_bootstrap(self._store, self._executor, execution_id))
+
+    def _schedule_fmr_node_report_sync(self, execution_id: str) -> None:
+        eid = str(execution_id or "").strip()
+        if not eid or eid in self._fmr_sync_inflight:
+            return
+        self._fmr_sync_inflight.add(eid)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._fmr_sync_inflight.discard(eid)
+            return
+
+        async def _runner() -> None:
+            try:
+                from .pfm_fmr_parse import sync_node_reports_from_canonical_fmr
+
+                updated = await asyncio.to_thread(sync_node_reports_from_canonical_fmr, self._store, eid)
+                if updated > 0:
+                    logger.info("[projects] Background FMR node-report sync updated %s rows for %s", updated, eid)
+            except Exception:
+                logger.exception("[projects] Background FMR node-report sync failed for %s", eid)
+            finally:
+                self._fmr_sync_inflight.discard(eid)
+
+        loop.create_task(_runner())
 
     # ------------------------------------------------------------------
     # Template endpoints
@@ -590,19 +826,57 @@ class ProjectHandlers:
     # Execution endpoints
     # ------------------------------------------------------------------
 
+    async def _enforce_single_active_reporting_run(
+        self,
+        template_id: str,
+        preferred_execution_id: str,
+    ) -> None:
+        if not template_id:
+            return
+        runs = list(self._store.list_executions(template_id=template_id) or [])
+        for run in runs:
+            if run.id == preferred_execution_id:
+                continue
+            raw_status = getattr(run, "status", "")
+            status = str(getattr(raw_status, "value", raw_status) or "").strip().lower()
+            if status in (ExecutionStatus.RUNNING.value, ExecutionStatus.PENDING.value):
+                if self._executor:
+                    await self._executor.cancel_execution(
+                        run.id,
+                        final_status=ExecutionStatus.CANCELLED,
+                        operator_stop_kind="cancel",
+                        cancel_reason=(
+                            "Closed automatically: only one active run is allowed "
+                            "per template for reporting and knowledge retrieval."
+                        ),
+                    )
+                else:
+                    self._store.update_execution(
+                        run.id,
+                        status=ExecutionStatus.CANCELLED,
+                        paused=False,
+                        operator_stop_kind="cancel",
+                        cancel_reason=(
+                            "Closed automatically: only one active run is allowed "
+                            "per template for reporting and knowledge retrieval."
+                        ),
+                    )
+            self._store.set_execution_reporting_activity(run.id, active=False)
+
+        self._store.set_execution_reporting_activity(preferred_execution_id, active=True)
+
     async def handle_list_executions(self, request: "web.Request") -> "web.Response":
         template_id = request.query.get("template_id")
         status = request.query.get("status")
-        executions = self._store.list_executions(
+        execution_payloads = self._store.list_execution_payloads(
             template_id=template_id or None,
             status=status or None,
         )
-        payloads = []
-        for e in executions:
-            raw = json.loads(e.model_dump_json())
-            raw.update(self._store.resolve_pfm_lineage_context(e))
-            payloads.append(_to_camel_dict(raw))
-        return _json_response({"executions": payloads})
+        return _json_response(
+            {
+                "executions": [_execution_list_item_dict(e, None) for e in execution_payloads],
+            }
+        )
 
     async def handle_get_execution(self, request: "web.Request") -> "web.Response":
         execution_id = request.match_info["execution_id"]
@@ -625,63 +899,7 @@ class ProjectHandlers:
                 )
             except Exception as exc:
                 logger.warning("[projects] Failed to persist recovered screenshots for %s: %s", execution_id, exc)
-        ex_latest = self._store.get_execution(execution_id) or execution
-        raw.update(self._store.resolve_pfm_lineage_context(ex_latest))
-        return _json_response(_to_camel_dict(raw))
-
-    async def handle_post_template_pfm_canonical(self, request: "web.Request") -> "web.Response":
-        """Operator (or integration) sets the template canonical PFM execution."""
-        template_id = request.match_info["template_id"]
-        try:
-            body = _to_snake_dict(await request.json())
-        except Exception:
-            return _error_response("Invalid JSON")
-        execution_id = str(body.get("execution_id") or body.get("executionId") or "").strip()
-        if not execution_id:
-            return _error_response("execution_id is required")
-        source = str(body.get("source") or "operator").strip()[:32] or "operator"
-        rationale = body.get("rationale") or body.get("rationale_text") or ""
-        tmpl = self._store.promote_template_canonical_pfm(
-            template_id,
-            execution_id,
-            source=source,
-            rationale=str(rationale) if rationale is not None else None,
-            require_eligible=False,
-        )
-        if not tmpl:
-            return _error_response(
-                "Could not promote canonical PFM (template or execution not found, "
-                "execution not linked to template, or no committed PFM tree).",
-                400,
-                "promotion_refused",
-            )
-        now_ms = int(time.time() * 1000)
-        self._store.update_execution(
-            execution_id,
-            pfm_canonical_evaluation_status="promoted",
-            pfm_canonical_replace_recommended=True,
-            pfm_canonical_evaluation_confidence=1.0,
-            pfm_canonical_evaluation_rationale=str(rationale or "operator_promotion")[:4000] or None,
-            pfm_canonical_evaluation_at_ms=now_ms,
-            pfm_canonical_promotion_applied=True,
-        )
-        return _template_json(tmpl)
-
-    async def handle_post_execution_evaluate_canonical(self, request: "web.Request") -> "web.Response":
-        """Re-run AI canonical evaluation (and optional promotion) for a completed execution."""
-        execution_id = request.match_info["execution_id"]
-        try:
-            body = _to_snake_dict(await request.json())
-        except Exception:
-            body = {}
-        force = _coerce_request_bool(body.get("force")) is True
-        from projects.pfm_canonical_judge import evaluate_and_maybe_promote_after_completion
-
-        result = await evaluate_and_maybe_promote_after_completion(
-            self._store, execution_id, force=force
-        )
-        status = 200 if result.get("ok") else 400
-        return _json_response(_to_camel_dict(result), status=status)
+        return _json_response(_execution_detail_dict(self._store, execution))
 
     async def handle_run_execution(self, request: "web.Request") -> "web.Response":
         try:
@@ -723,42 +941,10 @@ class ProjectHandlers:
                     400,
                 )
 
-        base_ai_prompt = body.get("ai_prompt", template.ai_prompt)
-        inherited_context = self._store.build_template_learning_context(template.id)
-        if inherited_context:
-            base_ai_prompt = "\n\n".join(
-                [
-                    str(base_ai_prompt or "").strip(),
-                    "## Template Learning Context",
-                    (
-                        "This same-template PFM context is locked until login succeeds. "
-                        "Do not read, summarize, mention, display, or rely on it before the login checkpoint "
-                        "reports login_phase_status=success."
-                    ),
-                    inherited_context,
-                    (
-                        "Instruction after login only: reuse these prior PFM mindmap/node-report findings "
-                        "as a starting hypothesis, then improve or correct them with new evidence."
-                    ),
-                ]
-            ).strip()
-
-        isolation_context = "\n".join(
-            [
-                "## Template Isolation Rules",
-                f"- Current template ID: `{template.id}`.",
-                f"- Current template name: `{template.name}`.",
-                f"- Current target URL: `{body.get('target_url', template.target_url) or ''}`.",
-                "- Hard rule: no global knowledge and no cross-template memory. Each project template is independent.",
-                "- Do not use facts from other project templates, previous runs, or persistent memory as current evidence unless they appear in the Template Learning Context above and belong to this exact template.",
-                "- If persistent memory mentions a different target, subdomain, template, or application, ignore it unless this run rediscovers it from the current target.",
-                "- Start from the current target URL. If the browser redirects to a different domain or subdomain, report the redirect as a fresh observation; do not assume it means this run is another project.",
-                "- Build the PFM and node EAD reports from evidence collected in this run plus same-template inherited context only.",
-            ]
-        )
-        base_ai_prompt = "\n\n".join(
-            [part for part in [str(base_ai_prompt or "").strip(), isolation_context] if part]
-        ).strip()
+        target_url = str(body.get("target_url", template.target_url) or "").strip()
+        user_prompt = str(body.get("ai_prompt", template.ai_prompt) or "").strip()
+        # Fast POST: template learning context + isolation rules are applied in deferred bootstrap.
+        base_ai_prompt = user_prompt
 
         execution = ProjectExecute(
             linked_template_id=template.id,
@@ -793,6 +979,7 @@ class ProjectHandlers:
         )
 
         created = self._store.create_execution(execution)
+        await self._enforce_single_active_reporting_run(template.id, created.id)
 
         logger.info(
             "[projects] Created execution %s for template %s (inherit_pfm=%s); deferred bootstrap",
@@ -811,6 +998,61 @@ class ProjectHandlers:
 
         raw = json.loads(created.model_dump_json())
         return _json_response(_to_camel_dict(raw), status=201)
+
+    async def handle_set_reporting_activity(self, request: "web.Request") -> "web.Response":
+        execution_id = request.match_info["execution_id"]
+        execution = self._store.get_execution(execution_id)
+        if not execution:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+        try:
+            body = _to_snake_dict(await request.json()) if request.can_read_body else {}
+        except Exception:
+            body = {}
+
+        active_raw = body.get("active")
+        status_raw = str(body.get("status") or "").strip().lower()
+        if active_raw is None:
+            if status_raw == ReportingActivityStatus.ACTIVE.value:
+                active = True
+            elif status_raw == ReportingActivityStatus.CLOSED.value:
+                active = False
+            else:
+                return _error_response("Provide either active=true/false or status=active|closed")
+        else:
+            active = bool(active_raw)
+
+        if not active:
+            raw_status = getattr(execution, "status", "")
+            status = str(getattr(raw_status, "value", raw_status) or "").strip().lower()
+            if status in (ExecutionStatus.RUNNING.value, ExecutionStatus.PENDING.value):
+                reason = (
+                    "Closed by operator for reporting/knowledge retrieval. "
+                    "Run auto-stopped to enforce single active run."
+                )
+                if self._executor:
+                    await self._executor.cancel_execution(
+                        execution_id,
+                        final_status=ExecutionStatus.CANCELLED,
+                        operator_stop_kind="cancel",
+                        cancel_reason=reason,
+                    )
+                else:
+                    self._store.update_execution(
+                        execution_id,
+                        status=ExecutionStatus.CANCELLED,
+                        paused=False,
+                        operator_stop_kind="cancel",
+                        cancel_reason=reason,
+                    )
+
+        updated = self._store.set_execution_reporting_activity(execution_id, active=active)
+        if not updated:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+
+        template_active_id = self._store.get_active_reporting_execution_id(updated.linked_template_id)
+        out = _to_camel_dict(json.loads(updated.model_dump_json()))
+        out["activeReportingExecutionId"] = template_active_id
+        return _json_response(out)
 
     async def handle_cancel_execution(self, request: "web.Request") -> "web.Response":
         execution_id = request.match_info["execution_id"]
@@ -902,92 +1144,6 @@ class ProjectHandlers:
         raw = json.loads(updated.model_dump_json())
         return _json_response(_to_camel_dict(raw))
 
-    async def handle_put_execution_learning(self, request: "web.Request") -> "web.Response":
-        execution_id = request.match_info["execution_id"]
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-
-        enabled = body.get("validForContinuousLearning")
-        if enabled is None:
-            enabled = body.get("valid_for_continuous_learning")
-        if enabled is None:
-            return _error_response(
-                "validForContinuousLearning is required (boolean)",
-                400,
-                "invalid_request",
-            )
-
-        execution = self._store.get_execution(execution_id)
-        if not execution:
-            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
-
-        reason = str(body.get("reason") or "").strip() or None
-        updated = self._store.set_execution_continuous_learning(
-            execution_id,
-            enabled=bool(enabled),
-            reason=reason,
-        )
-        if not updated:
-            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
-
-        action = "enabled" if bool(enabled) else "disabled"
-        logger.info("[projects] %s interactive learning for execution %s", action, execution_id)
-        raw = json.loads(updated.model_dump_json())
-        return _json_response(_to_camel_dict(raw))
-
-    async def handle_get_pfm_skills(self, request: "web.Request") -> "web.Response":
-        from .pfm_skills import (
-            list_execution_download_catalog,
-            list_execution_pfm_report_downloads,
-            list_execution_pfm_skills,
-        )
-
-        execution_id = request.match_info["execution_id"]
-        execution = self._store.get_execution(execution_id)
-        if not execution:
-            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
-        skills = list_execution_pfm_skills(self._store, execution_id)
-        reports = list_execution_pfm_report_downloads(self._store, execution_id)
-        catalog = list_execution_download_catalog(self._store, execution_id)
-        skill_rows = [s for s in skills if s.get("in_database") or s.get("local_exists")]
-        item_count = sum(len(cat.get("items") or []) for cat in catalog)
-        return _json_response(
-            {
-                "execution_id": execution_id,
-                "skills": [_to_camel_dict(s) for s in skills],
-                "reports": [_to_camel_dict(r) for r in reports],
-                "catalog": [_to_camel_dict(c) for c in catalog],
-                "has_skills": len(skill_rows) > 0,
-                "download_count": item_count,
-            }
-        )
-
-    async def handle_post_pfm_skills(self, request: "web.Request") -> "web.Response":
-        from .pfm_skills import create_execution_pfm_skills
-
-        execution_id = request.match_info["execution_id"]
-        execution = self._store.get_execution(execution_id)
-        if not execution:
-            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
-
-        result = create_execution_pfm_skills(self._store, execution_id)
-        if not result.get("ok"):
-            code = str(result.get("error") or "create_failed")
-            status = 404 if code in ("execution_not_found", "no_committed_tree") else 400
-            return _error_response(
-                str(result.get("message") or result.get("error") or "Unable to create skill files"),
-                status,
-                code,
-            )
-        payload = {
-            "execution_id": execution_id,
-            "skills": [_to_camel_dict(s) for s in result.get("skills") or []],
-            "skills_status": [_to_camel_dict(s) for s in result.get("skills_status") or []],
-        }
-        return _json_response(_to_camel_dict(payload))
-
     async def handle_get_execution_report(self, request: "web.Request") -> "web.Response":
         execution_id = request.match_info["execution_id"]
         filename = Path(request.match_info["filename"]).name
@@ -1019,7 +1175,6 @@ class ProjectHandlers:
         return web.FileResponse(path=target, headers={"Content-Type": content_type or "text/plain"})
 
     async def handle_get_node_report_artifact(self, request: "web.Request") -> "web.Response":
-        from .pfm_fmr_parse import ensure_node_reports_from_agent_delivery
         from .pfm_tree import node_report_artifact_key
 
         execution_id = request.match_info["execution_id"]
@@ -1029,7 +1184,6 @@ class ProjectHandlers:
         node_key = (request.query.get("node_key") or request.query.get("nodeKey") or "").strip()
         if not node_key:
             return _error_response("node_key is required")
-        ensure_node_reports_from_agent_delivery(self._store, execution_id)
         artifact_key = node_report_artifact_key(node_key)
         artifact = self._store.get_execution_pfm_artifact(execution_id, artifact_key)
         snapshot = self._store.get_committed_pfm_tree(execution_id)
@@ -1070,23 +1224,11 @@ class ProjectHandlers:
 
         node_key = str(body.get("node_key") or "").strip()
         title = str(body.get("title") or "").strip()
-        from .pfm_node_report_content import (
-            is_valid_node_report_markdown,
-            normalize_node_report_markdown,
-        )
-
-        content = normalize_node_report_markdown(str(body.get("content") or ""))
+        content = str(body.get("content") or "").strip()
         if not node_key:
             return _error_response("node_key is required")
         if not content:
             return _error_response("content is required")
-        if not is_valid_node_report_markdown(content):
-            return _error_response(
-                "content does not match the standard node report structure "
-                "(Node Summary plus Features/test cases or Explore and improve)",
-                400,
-                "invalid_node_report",
-            )
 
         artifact = self._store.save_node_ead_report_artifact(
             execution_id,
@@ -1102,250 +1244,124 @@ class ProjectHandlers:
     # Agent-authored PFM tree endpoints (commit_pfm_snapshot pipeline)
     # ------------------------------------------------------------------
 
-    async def handle_get_pfm_delivery_status(self, request: "web.Request") -> "web.Response":
-        """Compare on-disk agent delivery files vs DB snapshot baseline (filename + mtime)."""
+    async def handle_get_pfm_tree(self, request: "web.Request") -> "web.Response":
         execution_id = request.match_info["execution_id"]
         execution = self._store.get_execution(execution_id)
         if not execution:
             return _error_response(f"Execution {execution_id} not found", 404, "not_found")
-
-        from .pfm_delivery import (
-            compute_delivery_stamp,
-            filter_canonical_delivery_files,
-            has_newer_local_delivery,
-        )
-        from .pfm_tree import snapshot_has_committed_tree
-
-        if self._store.has_committed_pfm_tree(execution_id):
-            self._store.repair_pfm_snapshot_delivery_baseline(execution_id)
-            from .pfm_fmr_parse import ensure_node_reports_from_agent_delivery
-
-            ensure_node_reports_from_agent_delivery(self._store, execution_id)
-
-        stamp = compute_delivery_stamp(execution_id)
-        raw_snap = self._store._get_pfm_tree_snapshot_raw(execution_id)
-        prev_snap: Dict[str, Any] = raw_snap if snapshot_has_committed_tree(raw_snap) else {}
-        has_committed = self._store.has_committed_pfm_tree(execution_id)
-        would_rebuild = has_newer_local_delivery(prev_snap if prev_snap else None, stamp)
-
-        from .pfm_delivery import snapshot_delivery_baseline_for_api
-
-        baseline = snapshot_delivery_baseline_for_api(prev_snap if prev_snap else None)
-
-        return _json_response(
-            _to_camel_dict(
+        satisfied = (
+            getattr(execution, "pfm_refresh_satisfied_request_id", None) or ""
+        ).strip() or None
+        snapshot = self._store.get_committed_pfm_tree(execution_id)
+        if snapshot is None:
+            return _json_response(
                 {
-                    "execution_id": execution_id,
-                    "has_committed_snapshot": has_committed,
-                    "would_rebuild_from_delivery": would_rebuild,
-                    "refresh_will_rebuild": would_rebuild,
-                    "local_files": list(filter_canonical_delivery_files(stamp.get("files") or [])),
-                    "local_fingerprint": str(stamp.get("fingerprint") or ""),
-                    "local_delivery_mtime_ms": int(stamp.get("delivery_mtime_ms") or 0),
-                    "baseline_files": list(baseline.get("baseline_files") or []),
-                    "pfm_fmr_based_on_file": baseline.get("pfm_fmr_based_on_file"),
-                    "pfm_fmr_based_on_mtime_ms": baseline.get("pfm_fmr_based_on_mtime_ms"),
-                    "pfm_pfm_based_on_file": baseline.get("pfm_pfm_based_on_file"),
-                    "pfm_pfm_based_on_mtime_ms": baseline.get("pfm_pfm_based_on_mtime_ms"),
-                    "baseline_fingerprint": baseline.get("baseline_fingerprint") or "",
-                    "baseline_built_at_ms": int(baseline.get("baseline_built_at_ms") or 0),
-                    "baseline_delivery_mtime_ms": int(baseline.get("baseline_delivery_mtime_ms") or 0),
-                    "pfm_revision": int(prev_snap.get("revision") or 0) if prev_snap else 0,
-                    "pfm_generation_version": self._store.resolve_pfm_lineage_context(execution).get(
-                        "pfm_generation_version"
-                    ),
+                    "executionId": execution_id,
+                    "snapshot": None,
+                    "satisfiedRefreshRequestId": satisfied,
                 }
             )
-        )
-
-    async def handle_get_pfm_tree(self, request: "web.Request") -> "web.Response":
-        from .pfm_fmr_parse import ensure_node_reports_from_agent_delivery
-
-        execution_id = request.match_info["execution_id"]
-        execution = self._store.get_execution(execution_id)
-        if not execution:
-            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
-        if self._store.has_committed_pfm_tree(execution_id):
-            ensure_node_reports_from_agent_delivery(self._store, execution_id)
-        snapshot = self._store.get_committed_pfm_tree(execution_id)
-        lineage = _to_camel_dict(self._store.resolve_pfm_lineage_context(execution))
-        if snapshot is None:
-            return _json_response({"executionId": execution_id, "snapshot": None, **lineage})
-        from projects.pfm_tree import snapshot_generation, snapshot_revision
-
         return _json_response(
             {
                 "executionId": execution_id,
                 "snapshot": snapshot,
                 "version": int(snapshot.get("version") or 0),
-                "generation": snapshot_generation(snapshot),
-                "revision": snapshot_revision(snapshot),
                 "generatedAt": int(snapshot.get("generated_at") or 0),
-                **lineage,
+                "satisfiedRefreshRequestId": satisfied,
             }
         )
 
-    async def handle_post_pfm_request_snapshot(self, request: "web.Request") -> "web.Response":
-        """Queue agent commit_pfm_snapshot (active runs) or materialize from run data (inactive)."""
+    async def handle_get_pfm_persisted_state(self, request: "web.Request") -> "web.Response":
+        """Return DB-backed canonical PFM tree + all node EAD reports for this execution (read-only)."""
         execution_id = request.match_info["execution_id"]
         execution = self._store.get_execution(execution_id)
         if not execution:
             return _error_response(f"Execution {execution_id} not found", 404, "not_found")
 
+        snapshot = self._store.get_committed_pfm_tree(execution_id)
+        node_reports: List[Dict[str, Any]] = []
+        summaries_only = str(
+            request.query.get("summaries_only") or request.query.get("summariesOnly") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        for art in self._store.list_execution_pfm_artifacts(execution_id):
+            if str(art.get("artifact_type") or "") != "node_ead_report":
+                continue
+            content = str(art.get("content") or "")
+            row: Dict[str, Any] = {
+                "node_key": str(art.get("node_key") or "").strip(),
+                "artifact_key": str(art.get("artifact_key") or "").strip(),
+                "title": str(art.get("title") or "").strip(),
+                "created_at": art.get("created_at"),
+                "excerpt": str(art.get("excerpt") or "")[:800],
+                "content_length": len(content),
+            }
+            if not summaries_only:
+                row["content"] = content
+            node_reports.append(row)
+
+        payload = {
+            "execution_id": execution_id,
+            "committed_snapshot": snapshot,
+            "node_reports": node_reports,
+        }
+        return _json_response(_to_camel_dict(payload))
+
+    async def handle_post_pfm_request_snapshot(self, request: "web.Request") -> "web.Response":
+        """Refresh PFM from disk: rebuild DB only when .FMR/.pfm are newer than the committed baseline."""
+        execution_id = request.match_info["execution_id"]
+        execution = self._store.get_execution(execution_id)
+        if not execution:
+            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
+        if not self._executor:
+            return _error_response("Project executor is not available", 503, "unavailable")
+
         body: Dict[str, Any] = {}
-        try:
-            if request.body_exists:
-                raw = await request.json()
-                if isinstance(raw, dict):
-                    body = _to_snake_dict(raw)
-        except json.JSONDecodeError:
-            body = {}
-        except Exception:
-            return _error_response("Invalid JSON", 400, "invalid_json")
+        if request.can_read_body:
+            try:
+                body = _to_snake_dict(await request.json())
+            except Exception:
+                body = {}
 
-        explicit_materialize = _coerce_request_bool(body.get("materialize"))
-        promote_tc = _coerce_request_bool(body.get("promote_template_canonical"))
-        if promote_tc is None:
-            promote_tc = True
-
-        is_active = execution.status in (ExecutionStatus.RUNNING, ExecutionStatus.PENDING)
-        has_committed = self._store.has_committed_pfm_tree(execution_id)
-
-        # Rebuild DB from agent delivery only when the operator explicitly asked (Refresh EAD Feature Map).
-        refresh_from_delivery = _coerce_request_bool(body.get("refresh_from_delivery")) is True
-        if refresh_from_delivery:
+        refresh_delivery = body.get("refresh_from_delivery") in (True, "true", 1, "1")
+        if refresh_delivery:
+            from .pfm_delivery import ingest_workspace_delivery_exports
             from .pfm_refresh import try_refresh_pfm_from_delivery
 
-            delivery_result = try_refresh_pfm_from_delivery(
-                self._store,
-                execution_id,
-                promote_template_canonical=promote_tc,
+            ingest_workspace_delivery_exports(self._store, execution_id)
+            delivery_result = dict(
+                try_refresh_pfm_from_delivery(
+                    self._store,
+                    execution_id,
+                    promote_template_canonical=False,
+                )
             )
-            code = str(delivery_result.get("code") or "")
-            if code in ("no_changes", "materialized", "no_delivery_files"):
-                if code != "no_delivery_files" or not has_committed:
-                    raw = dict(delivery_result)
-                    raw["execution_id"] = execution_id
-                    if code in ("no_changes", "materialized"):
-                        return _json_response(_to_camel_dict(raw))
+            if delivery_result.get("ok") is True and delivery_result.get("code") != "no_delivery_files":
+                # Keep Refresh responsive: import per-node reports from .FMR asynchronously.
+                self._schedule_fmr_node_report_sync(execution_id)
+            delivery_result["execution_id"] = execution_id
+            return _json_response(_to_camel_dict(delivery_result))
 
-        if explicit_materialize is True:
-            from .pfm_materialize import materialize_operator_pfm_snapshot
-
-            result = materialize_operator_pfm_snapshot(
-                self._store,
-                execution_id,
-                promote_template_canonical=promote_tc,
-            )
-        elif explicit_materialize is False:
-            if not self._executor:
-                return _error_response("Project executor is not available", 503, "unavailable")
+        try:
             result = self._executor.request_pfm_snapshot_refresh(execution_id)
-        else:
-            # Completed run with no DB snapshot: materialize immediately (operator Refresh).
-            if execution.status == ExecutionStatus.COMPLETED and not has_committed:
-                from .pfm_materialize import materialize_operator_pfm_snapshot
-
-                result = materialize_operator_pfm_snapshot(
-                    self._store,
-                    execution_id,
-                    promote_template_canonical=promote_tc,
-                )
-            # Default: prefer agent commit_pfm_snapshot when session is live; else materialize.
-            elif self._executor:
-                nudged = self._executor.request_pfm_snapshot_refresh(execution_id)
-                if nudged.get("ok") and nudged.get("code") not in ("no_changes",):
-                    result = nudged
-                elif not has_committed or nudged.get("code") in (
-                    "execution_not_active",
-                    "no_session",
-                    "not_found",
-                ):
-                    from .pfm_materialize import materialize_operator_pfm_snapshot
-
-                    result = materialize_operator_pfm_snapshot(
-                        self._store,
-                        execution_id,
-                        promote_template_canonical=promote_tc,
-                    )
-                else:
-                    result = nudged
-            else:
-                if is_active:
-                    return _error_response("Project executor is not available", 503, "unavailable")
-                from .pfm_materialize import materialize_operator_pfm_snapshot
-
-                result = materialize_operator_pfm_snapshot(
-                    self._store,
-                    execution_id,
-                    promote_template_canonical=promote_tc,
-                )
+        except Exception as exc:
+            logger.exception(
+                "[projects] request_pfm_snapshot_refresh failed for %s", execution_id
+            )
+            return _json_response(
+                _to_camel_dict(
+                    {
+                        "ok": False,
+                        "code": "error",
+                        "message": str(exc)[:240],
+                        "execution_id": execution_id,
+                    }
+                ),
+                status=200,
+            )
 
         raw = dict(result)
         raw["execution_id"] = execution_id
         return _json_response(_to_camel_dict(raw))
-
-    async def handle_get_template_pfm_lineage_gaps(self, request: "web.Request") -> "web.Response":
-        from .pfm_lineage_backfill import list_pfm_lineage_gaps
-
-        template_id = request.match_info["template_id"]
-        return _json_response(_to_camel_dict(list_pfm_lineage_gaps(self._store, template_id)))
-
-    async def handle_post_template_pfm_backfill_lineage(self, request: "web.Request") -> "web.Response":
-        from .pfm_lineage_backfill import backfill_template_pfm_lineage
-
-        template_id = request.match_info["template_id"]
-        body: Dict[str, Any] = {}
-        try:
-            if request.body_exists:
-                raw = await request.json()
-                if isinstance(raw, dict):
-                    body = _to_snake_dict(raw)
-        except Exception:
-            body = {}
-        promote = body.get("promote_template_canonical")
-        promote_tc = True if promote is None else bool(promote)
-        result = backfill_template_pfm_lineage(
-            self._store,
-            template_id,
-            promote_template_canonical=promote_tc,
-        )
-        return _json_response(_to_camel_dict(result))
-
-    async def handle_get_execution_pfm_lineage_gaps(self, request: "web.Request") -> "web.Response":
-        execution_id = request.match_info["execution_id"]
-        execution = self._store.get_execution(execution_id)
-        if not execution:
-            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
-        from .pfm_lineage_backfill import list_pfm_lineage_gaps
-
-        return _json_response(
-            _to_camel_dict(list_pfm_lineage_gaps(self._store, execution.linked_template_id))
-        )
-
-    async def handle_post_execution_pfm_backfill_lineage(self, request: "web.Request") -> "web.Response":
-        execution_id = request.match_info["execution_id"]
-        execution = self._store.get_execution(execution_id)
-        if not execution:
-            return _error_response(f"Execution {execution_id} not found", 404, "not_found")
-        from .pfm_lineage_backfill import backfill_template_pfm_lineage
-
-        body: Dict[str, Any] = {}
-        try:
-            if request.body_exists:
-                raw = await request.json()
-                if isinstance(raw, dict):
-                    body = _to_snake_dict(raw)
-        except Exception:
-            body = {}
-        promote = body.get("promote_template_canonical")
-        promote_tc = True if promote is None else bool(promote)
-        result = backfill_template_pfm_lineage(
-            self._store,
-            execution.linked_template_id,
-            promote_template_canonical=promote_tc,
-        )
-        return _json_response(_to_camel_dict(result))
 
     async def handle_get_pfm_mindmap(self, request: "web.Request") -> "web.Response":
         from .pfm_tree import render_mermaid_for_scope
@@ -1418,7 +1434,7 @@ class ProjectHandlers:
             repaired = {
                 "node_path": [],
                 "selected_node_key": None,
-                "view_scope": "focus",
+                "view_scope": "top",
                 "depth_cap": 2,
                 "pfm_tree_version": 0,
                 "updated_at": int(time.time() * 1000),
@@ -1490,18 +1506,6 @@ class ProjectHandlers:
         app.router.add_post(
             "/v1/projects/templates/{template_id}/activate", self.handle_activate_template
         )
-        app.router.add_post(
-            "/v1/projects/templates/{template_id}/pfm/canonical",
-            self.handle_post_template_pfm_canonical,
-        )
-        app.router.add_get(
-            "/v1/projects/templates/{template_id}/pfm/lineage-gaps",
-            self.handle_get_template_pfm_lineage_gaps,
-        )
-        app.router.add_post(
-            "/v1/projects/templates/{template_id}/pfm/backfill-lineage",
-            self.handle_post_template_pfm_backfill_lineage,
-        )
 
         app.router.add_get("/v1/projects/executions", self.handle_list_executions)
         app.router.add_get("/v1/projects/executions/{execution_id}", self.handle_get_execution)
@@ -1509,14 +1513,6 @@ class ProjectHandlers:
         app.router.add_post(
             "/v1/projects/executions/{execution_id}/invalidate",
             self.handle_invalidate_execution,
-        )
-        app.router.add_put(
-            "/v1/projects/executions/{execution_id}/learning",
-            self.handle_put_execution_learning,
-        )
-        app.router.add_post(
-            "/v1/projects/executions/{execution_id}/learning",
-            self.handle_put_execution_learning,
         )
         app.router.add_post("/v1/projects/executions/run", self.handle_run_execution)
         app.router.add_post(
@@ -1527,6 +1523,10 @@ class ProjectHandlers:
         )
         app.router.add_post(
             "/v1/projects/executions/{execution_id}/resume", self.handle_resume_execution
+        )
+        app.router.add_post(
+            "/v1/projects/executions/{execution_id}/reporting-activity",
+            self.handle_set_reporting_activity,
         )
         app.router.add_get(
             "/v1/projects/executions/{execution_id}/reports/{filename}",
@@ -1541,24 +1541,16 @@ class ProjectHandlers:
             self.handle_get_node_report_artifact,
         )
         app.router.add_get(
-            "/v1/projects/executions/{execution_id}/pfm/delivery-status",
-            self.handle_get_pfm_delivery_status,
-        )
-        app.router.add_get(
             "/v1/projects/executions/{execution_id}/pfm/tree",
             self.handle_get_pfm_tree,
+        )
+        app.router.add_get(
+            "/v1/projects/executions/{execution_id}/pfm/persisted-state",
+            self.handle_get_pfm_persisted_state,
         )
         app.router.add_post(
             "/v1/projects/executions/{execution_id}/pfm/request-snapshot",
             self.handle_post_pfm_request_snapshot,
-        )
-        app.router.add_get(
-            "/v1/projects/executions/{execution_id}/pfm/lineage-gaps",
-            self.handle_get_execution_pfm_lineage_gaps,
-        )
-        app.router.add_post(
-            "/v1/projects/executions/{execution_id}/pfm/backfill-lineage",
-            self.handle_post_execution_pfm_backfill_lineage,
         )
         app.router.add_get(
             "/v1/projects/executions/{execution_id}/pfm/mindmap",
@@ -1571,16 +1563,4 @@ class ProjectHandlers:
         app.router.add_put(
             "/v1/projects/executions/{execution_id}/pfm/view",
             self.handle_put_pfm_view,
-        )
-        app.router.add_post(
-            "/v1/projects/executions/{execution_id}/pfm/evaluate-canonical",
-            self.handle_post_execution_evaluate_canonical,
-        )
-        app.router.add_get(
-            "/v1/projects/executions/{execution_id}/pfm/skills",
-            self.handle_get_pfm_skills,
-        )
-        app.router.add_post(
-            "/v1/projects/executions/{execution_id}/pfm/skills",
-            self.handle_post_pfm_skills,
         )

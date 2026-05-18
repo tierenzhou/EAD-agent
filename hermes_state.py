@@ -88,6 +88,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_session_ts_id ON messages(session_id, timestamp, id);
 """
 
 FTS_SQL = """
@@ -879,6 +880,33 @@ class SessionDB:
                     msg["tool_calls"] = json.loads(msg["tool_calls"])
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
+                    msg["tool_calls"] = []
+            result.append(msg)
+        return result
+
+    def get_messages_page(self, session_id: str, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """Load a bounded window of messages for a session."""
+        safe_limit = max(1, min(int(limit), 500))
+        safe_offset = max(0, int(offset))
+        with self._lock:
+            cursor = self._conn.execute(
+                (
+                    "SELECT * FROM messages "
+                    "WHERE session_id = ? "
+                    "ORDER BY timestamp, id "
+                    "LIMIT ? OFFSET ?"
+                ),
+                (session_id, safe_limit, safe_offset),
+            )
+            rows = cursor.fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            msg = dict(row)
+            if msg.get("tool_calls"):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize tool_calls in get_messages_page, falling back to []")
                     msg["tool_calls"] = []
             result.append(msg)
         return result

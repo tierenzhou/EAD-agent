@@ -9,15 +9,18 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional, Tuple
 
-from .pfm_delivery import compute_delivery_stamp, delivery_changed
+from .pfm_delivery import compute_canonical_delivery_stamp, delivery_changed
 from .pfm_tree import snapshot_generation, snapshot_revision
 
 logger = logging.getLogger(__name__)
 
+# Operator-facing copy when Refresh runs before agent delivery exists.
+NO_EAD_EXPLORE_DELIVERY_YET_MESSAGE = (
+    "No EAD Explore result delivered yet. Please try refresh again in a few minutes."
+)
+
 
 def _find_other_run_with_new_delivery(store: Any, execution: Any) -> str:
-    from .pfm_delivery import compute_delivery_stamp, delivery_changed
-
     template_id = str(getattr(execution, "linked_template_id", "") or "").strip()
     if not template_id:
         return ""
@@ -26,7 +29,7 @@ def _find_other_run_with_new_delivery(store: Any, execution: Any) -> str:
         oid = str(getattr(other, "id", "") or "").strip()
         if not oid or oid == eid:
             continue
-        stamp = compute_delivery_stamp(oid)
+        stamp = compute_canonical_delivery_stamp(oid)
         if not str(stamp.get("fingerprint") or "").strip():
             continue
         prev = store._get_pfm_tree_snapshot_raw(oid)
@@ -57,19 +60,22 @@ def try_refresh_pfm_from_delivery(
     *,
     promote_template_canonical: bool = True,
 ) -> Dict[str, Any]:
+    from .pfm_delivery import ingest_workspace_delivery_exports
     from .pfm_materialize import materialize_operator_pfm_snapshot
 
     execution = store.get_execution(execution_id)
     if not execution:
         return {"ok": False, "code": "not_found", "message": "Execution not found"}
 
-    stamp = compute_delivery_stamp(execution_id)
+    ingest_workspace_delivery_exports(store, execution_id)
+
+    stamp = compute_canonical_delivery_stamp(execution_id)
     fp = str(stamp.get("fingerprint") or "")
     if not fp:
         return {
             "ok": True,
             "code": "no_delivery_files",
-            "message": "No agent-delivered PFM files on disk for this run.",
+            "message": NO_EAD_EXPLORE_DELIVERY_YET_MESSAGE,
         }
 
     prev_raw = store._get_pfm_tree_snapshot_raw(execution_id)
