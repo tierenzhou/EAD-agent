@@ -17,7 +17,7 @@ def reporting_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProjectS
     return store
 
 
-def _mk_exec(execution_id: str, start_ms: int, status: ExecutionStatus = ExecutionStatus.COMPLETED) -> ProjectExecute:
+def _mk_exec(execution_id: str, start_ms: int, status: ExecutionStatus = ExecutionStatus.RUNNING) -> ProjectExecute:
     return ProjectExecute(
         id=execution_id,
         linked_template_id="tpl-report",
@@ -40,21 +40,45 @@ def test_single_active_run_enforced_by_recency(reporting_store: ProjectStore):
     assert reporting_store.get_active_reporting_execution_id("tpl-report") == "exec-3"
 
 
-def test_close_active_promotes_next_valid_result_run(reporting_store: ProjectStore):
+def test_close_active_does_not_promote_finished_or_old_runs(reporting_store: ProjectStore):
     reporting_store.create_execution(_mk_exec("exec-1", 1_000))
     reporting_store.create_execution(_mk_exec("exec-2", 2_000))
     reporting_store.create_execution(_mk_exec("exec-3", 3_000))
 
     reporting_store.set_execution_reporting_activity("exec-3", active=False)
-    assert reporting_store.get_active_reporting_execution_id("tpl-report") == "exec-2"
+    assert reporting_store.get_active_reporting_execution_id("tpl-report") is None
     assert reporting_store.get_execution("exec-3").reporting_activity_status == ReportingActivityStatus.CLOSED
 
 
 def test_pending_run_can_still_be_selected_as_active(reporting_store: ProjectStore):
-    reporting_store.create_execution(_mk_exec("exec-1", 1_000))
+    reporting_store.create_execution(_mk_exec("exec-1", 1_000, status=ExecutionStatus.COMPLETED))
     pending = reporting_store.create_execution(
         _mk_exec("exec-2", 2_000, status=ExecutionStatus.PENDING)
     )
     assert pending.reporting_activity_status == ReportingActivityStatus.ACTIVE
     assert reporting_store.get_active_reporting_execution_id("tpl-report") == "exec-2"
+
+
+def test_terminal_execution_created_closed(reporting_store: ProjectStore):
+    completed = reporting_store.create_execution(
+        _mk_exec("exec-done", 1_000, status=ExecutionStatus.COMPLETED)
+    )
+
+    assert completed.reporting_activity_status == ReportingActivityStatus.CLOSED
+    assert reporting_store.get_active_reporting_execution_id("tpl-report") is None
+
+
+def test_get_active_executions_excludes_reporting_closed(reporting_store: ProjectStore):
+    active = reporting_store.create_execution(
+        _mk_exec("exec-active", 1_000, status=ExecutionStatus.RUNNING)
+    )
+    closed = reporting_store.create_execution(
+        _mk_exec("exec-closed", 2_000, status=ExecutionStatus.PENDING)
+    )
+    reporting_store.set_execution_reporting_activity(active.id, active=True)
+    reporting_store.set_execution_reporting_activity(closed.id, active=False)
+
+    active_ids = {execution.id for execution in reporting_store.get_active_executions()}
+    assert active.id in active_ids
+    assert closed.id not in active_ids
 

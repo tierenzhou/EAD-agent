@@ -589,6 +589,31 @@ class ProjectExecutor:
             logger.error("[executor] Execution %s not found", execution_id)
             return
 
+        if execution.status not in (ExecutionStatus.PENDING, ExecutionStatus.RUNNING):
+            logger.info(
+                "[executor] start_execution skipped: execution %s is terminal/inactive (%s)",
+                execution_id,
+                getattr(execution.status, "value", execution.status),
+            )
+            self._close_reporting_activity(execution_id)
+            return
+
+        if str(getattr(execution.reporting_activity_status, "value", execution.reporting_activity_status)).lower() == "closed":
+            logger.info(
+                "[executor] start_execution skipped: execution %s is reporting-closed",
+                execution_id,
+            )
+            self._store.update_execution(
+                execution_id,
+                status=ExecutionStatus.CANCELLED,
+                paused=False,
+                cancel_reason=(
+                    execution.cancel_reason
+                    or "Execution was reporting-closed before monitor startup."
+                ),
+            )
+            return
+
         self._store.update_execution(
             execution_id,
             status=ExecutionStatus.RUNNING,
@@ -619,9 +644,30 @@ class ProjectExecutor:
         task = self._running.get(execution_id)
         return task is not None and not task.done()
 
+    def _close_reporting_activity(self, execution_id: str) -> None:
+        """Close reporting/chat activity for finished runs."""
+        try:
+            self._store.set_execution_reporting_activity(execution_id, active=False)
+        except Exception as exc:
+            logger.debug(
+                "[executor] Failed to close reporting activity for %s: %s",
+                execution_id,
+                exc,
+            )
+
     async def resume_active_executions(self) -> None:
         """Reattach monitor loops for running/pending executions after process restart."""
         from projects.run_bootstrap import run_execution_bootstrap
+
+        try:
+            closed = self._store.close_terminal_reporting_activity()
+            if closed:
+                logger.info(
+                    "[executor] Closed reporting activity for %d terminal execution(s) on startup",
+                    closed,
+                )
+        except Exception as exc:
+            logger.debug("[executor] Terminal reporting cleanup failed on startup: %s", exc)
 
         for execution in self._store.get_active_executions():
             execution_id = execution.id
@@ -667,8 +713,9 @@ class ProjectExecutor:
                     ExecutionStatus.CANCELLED,
                     ExecutionStatus.ERROR,
                 ):
-                    await self._sync_pfm_artifacts(execution_id, force=True)
+                    self._close_reporting_activity(execution_id)
                     if execution.status == ExecutionStatus.COMPLETED:
+                        await self._sync_pfm_artifacts(execution_id, force=True)
                         await self._finalize_completed_execution(execution_id)
                     logger.info(
                         "[executor] Execution %s is terminal: %s",
@@ -1903,6 +1950,7 @@ class ProjectExecutor:
             operator_stop_kind=operator_stop_kind,
             cancel_reason=cancel_reason,
         )
+        self._close_reporting_activity(execution_id)
         if final_status == ExecutionStatus.COMPLETED:
             try:
                 await self._sync_pfm_artifacts(execution_id, force=True)

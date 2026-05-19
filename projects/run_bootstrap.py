@@ -58,6 +58,10 @@ async def run_execution_bootstrap(
         logger.info("[projects.bootstrap] skip execution=%s (missing)", execution_id)
         return
 
+    if _should_abort_bootstrap(ex):
+        logger.info("[projects.bootstrap] skip execution=%s (not pending)", execution_id)
+        return
+
     if (ex.run_session_key or "").strip():
         if executor and not executor.has_active_monitor(execution_id):
             try:
@@ -68,10 +72,6 @@ async def run_execution_bootstrap(
                 )
             except Exception as exc:
                 logger.error("[projects.bootstrap] executor start failed %s: %s", execution_id, exc)
-        return
-
-    if _should_abort_bootstrap(ex):
-        logger.info("[projects.bootstrap] skip execution=%s (not pending)", execution_id)
         return
 
     template_id = ex.linked_template_id

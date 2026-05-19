@@ -54,6 +54,16 @@ def _has_valid_reporting_result(ex: ProjectExecute) -> bool:
     return status == ExecutionStatus.COMPLETED.value
 
 
+def _is_terminal_execution_status(status: object) -> bool:
+    value = str(getattr(status, "value", status) or "").strip().lower()
+    return value in {
+        ExecutionStatus.COMPLETED.value,
+        ExecutionStatus.FAILED.value,
+        ExecutionStatus.CANCELLED.value,
+        ExecutionStatus.ERROR.value,
+    }
+
+
 _DEFAULT_DB_DIR = Path.home() / ".hermes" / "projects"
 _DEFAULT_DB_PATH = _DEFAULT_DB_DIR / "projects.db"
 
@@ -346,6 +356,8 @@ class ProjectStore:
         return ProjectExecute.model_validate_json(row["data"])
 
     def create_execution(self, execution: ProjectExecute) -> ProjectExecute:
+        if _is_terminal_execution_status(execution.status):
+            execution.reporting_activity_status = ReportingActivityStatus.CLOSED
         data = execution.model_dump_json()
         created_at = execution.start_time or int(time.time() * 1000)
 
@@ -356,10 +368,11 @@ class ProjectStore:
             )
 
         self._execute_write(_write)
-        self.ensure_single_active_reporting_execution(
-            execution.linked_template_id,
-            preferred_execution_id=execution.id,
-        )
+        if not _is_terminal_execution_status(execution.status):
+            self.ensure_single_active_reporting_execution(
+                execution.linked_template_id,
+                preferred_execution_id=execution.id,
+            )
         from .pfm_run_number import ensure_template_run_numbers
 
         ensure_template_run_numbers(self, execution.linked_template_id)
@@ -499,11 +512,22 @@ class ProjectStore:
                 execution_id,
                 reporting_activity_status=ReportingActivityStatus.CLOSED,
             )
-            self.ensure_single_active_reporting_execution(
-                execution.linked_template_id,
-                exclude_execution_id=execution_id,
-            )
         return self.get_execution(execution_id)
+
+    def close_terminal_reporting_activity(self) -> int:
+        """Mark finished executions as reporting-closed without promoting older runs."""
+        closed = 0
+        for execution in self.list_executions():
+            if not _is_terminal_execution_status(execution.status):
+                continue
+            if execution.reporting_activity_status == ReportingActivityStatus.CLOSED:
+                continue
+            self.update_execution(
+                execution.id,
+                reporting_activity_status=ReportingActivityStatus.CLOSED,
+            )
+            closed += 1
+        return closed
 
     def set_execution_continuous_learning(
         self,
@@ -2197,5 +2221,12 @@ class ProjectStore:
     # ------------------------------------------------------------------
 
     def get_active_executions(self) -> List[ProjectExecute]:
-        return self.list_executions(status=ExecutionStatus.RUNNING.value) + \
-               self.list_executions(status=ExecutionStatus.PENDING.value)
+        active_statuses = (
+            self.list_executions(status=ExecutionStatus.RUNNING.value)
+            + self.list_executions(status=ExecutionStatus.PENDING.value)
+        )
+        return [
+            execution
+            for execution in active_statuses
+            if execution.reporting_activity_status != ReportingActivityStatus.CLOSED
+        ]
