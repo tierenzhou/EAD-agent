@@ -44,6 +44,57 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
+def test_sanitize_api_messages_adds_adjacent_stub_for_missing_tool_result():
+    messages = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "user", "content": "continue"},
+    ]
+
+    out = AIAgent._sanitize_api_messages(messages)
+
+    assert out[1]["role"] == "assistant"
+    assert out[2]["role"] == "tool"
+    assert out[2]["tool_call_id"] == "call_1"
+    assert out[3]["role"] == "user"
+
+
+def test_sanitize_api_messages_moves_late_tool_result_next_to_call():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "user", "content": "this interrupted the tool result"},
+        {"role": "tool", "tool_call_id": "call_1", "content": "late result"},
+    ]
+
+    out = AIAgent._sanitize_api_messages(messages)
+
+    assert out[0]["role"] == "assistant"
+    assert out[1]["role"] == "tool"
+    assert out[1]["tool_call_id"] == "call_1"
+    assert "unavailable" in out[1]["content"]
+    assert all(not (m.get("role") == "tool" and m.get("content") == "late result") for m in out)
+
+
 @pytest.fixture()
 def agent():
     """Minimal AIAgent with mocked OpenAI client and tool loading."""

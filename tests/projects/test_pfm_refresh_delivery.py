@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -9,7 +10,12 @@ from pathlib import Path
 import pytest
 
 from projects.models import ExecutionStatus, ProjectExecute, ProjectTemplate
-from projects.pfm_delivery import compute_delivery_stamp, delivery_changed
+from projects.pfm_delivery import (
+    compute_canonical_delivery_stamp,
+    compute_delivery_stamp,
+    delivery_changed,
+    ingest_workspace_delivery_exports,
+)
 from projects.pfm_refresh import try_refresh_pfm_from_delivery
 from projects.store import ProjectStore
 from tests.projects.test_pfm_canonical import _commit_minimal_tree
@@ -74,8 +80,37 @@ def _write_delivery(
     pfm = d / f"{execution_id}.pfm"
     mmd = d / "pfm-mindmap.mmd"
     report = d / "pfm-report.md"
-    fmr.write_text(f"# FMR {content}\n", encoding="utf-8")
-    pfm.write_text(f"PFM {content}\n", encoding="utf-8")
+    fmr.write_text(
+        (
+            f"# FMR {content}\n\n"
+            "## Per-Node EAD Reports\n\n"
+            f"### Node 1: Delivery {content}\n"
+            f"- Node Key: `{execution_id}-delivery`\n"
+            "- Status: `Success`\n\n"
+            "Description: Delivery-backed report\n\n"
+            "#### Node EAD Report\n"
+            "Node Summary:\n"
+            "Purpose: Verify refresh from canonical FMR.\n\n"
+            "Features:\n\n"
+            "Feature F-001: Delivery path\n\n"
+            "Test Case TC-001: Refresh applies parsed node reports.\n"
+        ),
+        encoding="utf-8",
+    )
+    pfm.write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {
+                        "nodeKey": f"{execution_id}-delivery",
+                        "title": f"Delivery {content}",
+                        "status": "No Run",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
     mmd.write_text(f"mindmap\n  root(({content}))\n", encoding="utf-8")
     report.write_text(f"# Report {content}\n", encoding="utf-8")
     if mtime_epoch is not None:
@@ -298,6 +333,97 @@ def test_compute_delivery_stamp_uses_filename_not_content(
     os.utime(fmr, (atime, mtime))
     stamp_b = compute_delivery_stamp("exec-v10")
     assert stamp_a.get("fingerprint") == stamp_b.get("fingerprint")
+
+
+def test_ingest_workspace_copies_canonical_pfm(
+    refresh_store: ProjectStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Monkeypatched workspace dir: canonical *.pfm is copied into EAD_REPORT_DIR."""
+    ws = refresh_store.db_path.parent / "ws-reports"
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "run-exec-v10.pfm").write_text(
+        '{"nodes":[{"id":"n1","children":[],"features":[]}]}',
+        encoding="utf-8",
+    )
+
+    def _fake_discover(ex: object) -> list[Path]:
+        return [ws]
+
+    monkeypatch.setattr(
+        "projects.pfm_delivery.discover_workspace_delivery_dirs",
+        _fake_discover,
+    )
+    out = ingest_workspace_delivery_exports(refresh_store, "exec-v10")
+    assert out.get("ok") is True
+    assert "run-exec-v10.pfm" in (out.get("files") or [])
+
+    report_root = os.environ["EAD_REPORT_DIR"]
+    dest = Path(report_root) / "exec-v10" / "run-exec-v10.pfm"
+    assert dest.is_file()
+    stamp = compute_canonical_delivery_stamp("exec-v10")
+    assert str(stamp.get("fingerprint") or "").strip()
+
+
+def test_refresh_no_delivery_includes_locations(
+    refresh_store: ProjectStore,
+) -> None:
+    out = try_refresh_pfm_from_delivery(refresh_store, "exec-v10", promote_template_canonical=False)
+    assert out.get("code") == "no_delivery_files"
+    msg = str(out.get("message") or "")
+    assert "canonical" in msg.lower()
+    assert "exec-v10" in msg or os.environ.get("EAD_REPORT_DIR", "") in msg
+
+
+def test_refresh_requires_paired_canonical_delivery(
+    refresh_store: ProjectStore,
+    tmp_path: Path,
+) -> None:
+    report_root = tmp_path / "reports"
+    d = report_root / "exec-v10"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "exec-v10.pfm").write_text(
+        json.dumps({"nodes": [{"nodeKey": "exec-v10-delivery", "title": "Only PFM"}]}),
+        encoding="utf-8",
+    )
+    out = try_refresh_pfm_from_delivery(refresh_store, "exec-v10", promote_template_canonical=False)
+    assert out.get("code") == "awaiting_delivery"
+    assert "both .pfm and .FMR" in str(out.get("message") or "")
+
+
+def test_refresh_fmr_only_still_syncs_node_reports(
+    refresh_store: ProjectStore,
+    tmp_path: Path,
+) -> None:
+    report_root = tmp_path / "reports"
+    d = report_root / "exec-v10"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "exec-v10.FMR").write_text(
+        (
+            "# FMR\n\n"
+            "## Per-Node EAD Reports\n\n"
+            "### Node 1: Login\n"
+            "- Node Key: `auth/login`\n"
+            "- Status: `Success`\n\n"
+            "Description: Login flow\n\n"
+            "#### Node EAD Report\n"
+            "Node Summary:\n"
+            "Purpose: Sign in\n\n"
+            "Features:\n\n"
+            "Feature F-001: Dashboard\n\n"
+            "Test Case TC-001: Open login\n"
+        ),
+        encoding="utf-8",
+    )
+    out = try_refresh_pfm_from_delivery(refresh_store, "exec-v10", promote_template_canonical=False)
+    assert out.get("code") == "fmr_reports_synced_no_pfm"
+    assert int(out.get("fmr_node_reports_synced") or 0) >= 1
+    art = refresh_store.get_execution_pfm_artifact(
+        "exec-v10",
+        "node-ead-report-auth-login.md",
+    )
+    assert art is not None
+    assert "Feature F-001" in str(art.get("content") or "")
 
 
 def test_export_mmd_touch_does_not_trigger_rebuild() -> None:

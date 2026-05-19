@@ -3155,54 +3155,71 @@ class AIAgent:
             filtered.append(msg)
         messages = filtered
 
-        surviving_call_ids: set = set()
-        for msg in messages:
-            if msg.get("role") == "assistant":
-                for tc in msg.get("tool_calls") or []:
-                    cid = AIAgent._get_tool_call_id_static(tc)
-                    if cid:
-                        surviving_call_ids.add(cid)
+        # OpenAI-compatible chat APIs require every assistant message with
+        # tool_calls to be followed immediately by one tool message per
+        # tool_call_id.  A global "result exists somewhere later" check is not
+        # enough; interrupted/restarted sessions can leave tool results delayed,
+        # missing, or orphaned.  Rebuild a valid sequence.
+        patched: List[Dict[str, Any]] = []
+        i = 0
+        stubbed = 0
+        removed_orphaned = 0
+        while i < len(messages):
+            msg = messages[i]
+            role = msg.get("role")
+            if role == "tool":
+                removed_orphaned += 1
+                i += 1
+                continue
 
-        result_call_ids: set = set()
-        for msg in messages:
-            if msg.get("role") == "tool":
-                cid = msg.get("tool_call_id")
-                if cid:
-                    result_call_ids.add(cid)
+            patched.append(msg)
+            if role != "assistant":
+                i += 1
+                continue
 
-        # 1. Drop tool results with no matching assistant call
-        orphaned_results = result_call_ids - surviving_call_ids
-        if orphaned_results:
-            messages = [
-                m for m in messages
-                if not (m.get("role") == "tool" and m.get("tool_call_id") in orphaned_results)
+            tool_calls = msg.get("tool_calls") or []
+            expected_ids = [
+                AIAgent._get_tool_call_id_static(tc)
+                for tc in tool_calls
+                if AIAgent._get_tool_call_id_static(tc)
             ]
-            logger.debug(
-                "Pre-call sanitizer: removed %d orphaned tool result(s)",
-                len(orphaned_results),
-            )
+            if not expected_ids:
+                i += 1
+                continue
 
-        # 2. Inject stub results for calls whose result was dropped
-        missing_results = surviving_call_ids - result_call_ids
-        if missing_results:
-            patched: List[Dict[str, Any]] = []
-            for msg in messages:
-                patched.append(msg)
-                if msg.get("role") == "assistant":
-                    for tc in msg.get("tool_calls") or []:
-                        cid = AIAgent._get_tool_call_id_static(tc)
-                        if cid in missing_results:
-                            patched.append({
-                                "role": "tool",
-                                "content": "[Result unavailable — see context summary above]",
-                                "tool_call_id": cid,
-                            })
-            messages = patched
+            i += 1
+            following_tools: Dict[str, Dict[str, Any]] = {}
+            while i < len(messages) and messages[i].get("role") == "tool":
+                tool_msg = messages[i]
+                cid = str(tool_msg.get("tool_call_id") or "").strip()
+                if cid in expected_ids and cid not in following_tools:
+                    following_tools[cid] = tool_msg
+                else:
+                    removed_orphaned += 1
+                i += 1
+
+            for cid in expected_ids:
+                if cid in following_tools:
+                    patched.append(following_tools[cid])
+                else:
+                    patched.append({
+                        "role": "tool",
+                        "content": "[Tool result unavailable because the previous agent turn was interrupted or the gateway restarted.]",
+                        "tool_call_id": cid,
+                    })
+                    stubbed += 1
+
+        if removed_orphaned:
             logger.debug(
-                "Pre-call sanitizer: added %d stub tool result(s)",
-                len(missing_results),
+                "Pre-call sanitizer: removed %d orphaned/misordered tool result(s)",
+                removed_orphaned,
             )
-        return messages
+        if stubbed:
+            logger.debug(
+                "Pre-call sanitizer: added %d missing adjacent tool result stub(s)",
+                stubbed,
+            )
+        return patched
 
     @staticmethod
     def _cap_delegate_task_calls(tool_calls: list) -> list:
@@ -6309,6 +6326,8 @@ class AIAgent:
             if self._cached_system_prompt:
                 api_messages = [{"role": "system", "content": self._cached_system_prompt}] + api_messages
 
+            api_messages = self._sanitize_api_messages(api_messages)
+
             # Make one API call with only the memory tool available
             memory_tool_def = None
             for t in (self.tools or []):
@@ -7273,6 +7292,8 @@ class AIAgent:
                 sys_offset = 1 if effective_system else 0
                 for idx, pfm in enumerate(self.prefill_messages):
                     api_messages.insert(sys_offset + idx, pfm.copy())
+
+            api_messages = self._sanitize_api_messages(api_messages)
 
             summary_extra_body = {}
             _is_nous = "nousresearch" in self._base_url_lower

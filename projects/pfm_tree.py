@@ -17,6 +17,7 @@ Public API:
     validate_and_normalize_snapshot   - validate payload + flatten the tree
     load_committed_tree               - read latest committed tree (or None)
     render_mermaid_for_scope          - slice the tree and produce Mermaid text
+    list_clickable_nodes_for_scope    - node keys/labels for the current mindmap view (drill UI)
     apply_view_state_to_tree          - repair a saved selection against the latest tree
 """
 
@@ -33,6 +34,14 @@ PFM_TREE_ARTIFACT_KEY = "pfm-tree.json"
 PFM_TREE_ARTIFACT_TYPE = "pfm_tree"
 PFM_VIEW_STATE_ARTIFACT_KEY = "pfm-view-state.json"
 PFM_VIEW_STATE_ARTIFACT_TYPE = "pfm_view_state"
+# These artifacts are execution-local state and must never be copied when
+# seeding a new run from a prior run/template artifacts.
+NON_INHERITABLE_PFM_ARTIFACT_TYPES = frozenset(
+    {
+        PFM_TREE_ARTIFACT_TYPE,
+        PFM_VIEW_STATE_ARTIFACT_TYPE,
+    }
+)
 
 NODE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-./]*$")
 MAX_TREE_DEPTH = 24
@@ -506,6 +515,38 @@ def _index_flat(flat: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {str(n.get("node_key") or ""): n for n in flat or [] if n.get("node_key")}
 
 
+def _parent_key_from_node_key(node_key: str, keys: Set[str]) -> Optional[str]:
+    """
+    Reconstruct a missing parent from a persisted hierarchical node_key path.
+
+    Older committed snapshots can have correct slash-path node_key values but
+    null parent_node_key on every row. The DB tree remains authoritative; the
+    renderer should repair those relationships instead of falling back to junk
+    placeholder mindmaps.
+    """
+    key = str(node_key or "").strip()
+    if "/" not in key:
+        return None
+    parent = key.rsplit("/", 1)[0]
+    return parent if parent in keys else None
+
+
+def normalize_db_tree_parent_links(flat: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return DB flat_nodes with missing parent_node_key repaired from node_key paths."""
+    keys = {str(n.get("node_key") or "").strip() for n in flat or [] if n.get("node_key")}
+    out: List[Dict[str, Any]] = []
+    for node in flat or []:
+        row = dict(node)
+        key = str(row.get("node_key") or "").strip()
+        parent = str(row.get("parent_node_key") or "").strip()
+        if key and not parent:
+            inferred = _parent_key_from_node_key(key, keys)
+            if inferred:
+                row["parent_node_key"] = inferred
+        out.append(row)
+    return out
+
+
 def _children_index(flat: List[Dict[str, Any]]) -> Dict[Optional[str], List[Dict[str, Any]]]:
     children: Dict[Optional[str], List[Dict[str, Any]]] = {}
     for n in flat or []:
@@ -639,6 +680,7 @@ def is_operator_top_level_node(
 
 def operator_top_level_spoke_nodes(flat: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Product modules shown on the first mindmap screen (run name at center)."""
+    flat = normalize_db_tree_parent_links(flat)
     hub_keys = collect_center_hub_keys(flat)
     spokes = [n for n in flat if is_operator_top_level_node(n, hub_keys)]
     spokes.sort(
@@ -653,6 +695,7 @@ def normalize_operator_flat_nodes(flat: List[Dict[str, Any]]) -> List[Dict[str, 
 
     Also collapses duplicate hub path segments in node_key / parent_node_key.
     """
+    flat = normalize_db_tree_parent_links(flat)
     hub_keys = collect_center_hub_keys(flat)
     if not hub_keys:
         out: List[Dict[str, Any]] = []
@@ -906,6 +949,7 @@ def render_mermaid_for_scope(
 ) -> str:
     """Render Mermaid mindmap text for the requested scope, using the committed tree only."""
     flat = list(snapshot.get("flat_nodes") or []) if isinstance(snapshot, dict) else []
+    flat = normalize_db_tree_parent_links(flat)
     by_key = _index_flat(flat)
     children = _children_index(flat)
     center_hubs = collect_center_hub_keys(flat)
@@ -980,6 +1024,61 @@ def render_mermaid_for_scope(
 
     lines.append(f"    Unknown scope: {scope}")
     return sanitize_mermaid_diagram("\n".join(lines) + "\n")
+
+
+def list_clickable_nodes_for_scope(
+    snapshot: Dict[str, Any],
+    *,
+    scope: str = "top",
+    node_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return drill targets for the current mindmap scope (same nodes as rendered children)."""
+    flat = list(snapshot.get("flat_nodes") or []) if isinstance(snapshot, dict) else []
+    if not flat:
+        return []
+    by_key = _index_flat(flat)
+    children = _children_index(flat)
+    center_hubs = collect_center_hub_keys(flat)
+    resolved_key = resolve_node_key_in_snapshot(node_key, by_key) if node_key else None
+    if resolved_key and resolved_key in center_hubs:
+        resolved_key = None
+
+    s = (scope or "top").strip().lower()
+    visible: List[Dict[str, Any]] = []
+    if s == "top":
+        if tree_looks_like_agent_narration_flat(flat):
+            return []
+        visible = operator_top_level_spoke_nodes(flat)
+    elif s == "focus" and resolved_key:
+        visible = [
+            n
+            for n in (children.get(resolved_key, []) or [])
+            if not _is_junk_mindmap_node_title(str(n.get("title") or ""))
+        ]
+    else:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for node in visible:
+        nk = str(node.get("node_key") or "").strip()
+        if not nk or nk in center_hubs:
+            continue
+        label = _mermaid_label(node)
+        title = str(node.get("title") or nk).strip() or nk
+        direct_children = [
+            c
+            for c in (children.get(nk, []) or [])
+            if not _is_junk_mindmap_node_title(str(c.get("title") or ""))
+        ]
+        out.append(
+            {
+                "node_key": nk,
+                "title": title,
+                "label": label,
+                "child_count": len(direct_children),
+            }
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------

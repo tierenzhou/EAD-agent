@@ -663,21 +663,34 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
         if not execution:
             return json.dumps({"error": f"Execution {execution_id} not found"})
 
-        reports = build_and_persist_pfm_artifacts(execution)
+        reports = build_and_persist_pfm_artifacts(execution, project_store=s)
         s.update_execution(execution_id, reports=reports)
         s.sync_execution_pfm_artifacts_from_state(execution_id)
+        persist_out: dict = {}
         try:
-            s.maybe_commit_pfm_snapshot_after_publish(execution_id)
+            persist_out = s.persist_pfm_tree_from_execution_state(execution_id)
         except Exception:
             logger.exception(
-                "[projects] maybe_commit_pfm_snapshot_after_publish failed for %s",
+                "[projects] persist_pfm_tree_from_execution_state failed after publish for %s",
                 execution_id,
             )
+            persist_out = {
+                "ok": False,
+                "code": "error",
+                "message": "persist_pfm_tree_from_execution_state raised; see server logs",
+            }
+        materialized = bool(persist_out.get("ok") and persist_out.get("code") == "materialized")
         return json.dumps(
             {
                 "published": True,
                 "execution_id": execution_id,
                 "reports": [r.model_dump() for r in reports],
+                "pfm_snapshot_persist": {
+                    "materialized": materialized,
+                    "ok": bool(persist_out.get("ok")),
+                    "code": persist_out.get("code"),
+                    "message": persist_out.get("message"),
+                },
             }
         )
 
@@ -687,10 +700,16 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
         schema={
             "type": "object",
             "description": (
-                "Generate and publish PFM mindmap/report artifacts for the current "
-                "EAD project execution, then attach them to the run. If no agent-authored "
-                "pfm-tree exists yet, the server may auto-commit v1 from results and "
-                "progress-log PFM nodes so the operator mindmap can render."
+                "Generate and publish PFM mindmap/report artifacts (pfm-mindmap.mmd, "
+                "pfm-report.md) for the execution, sync them into the artifact store, then "
+                "attempt to persist a v1 committed PFM tree when none exists yet (from "
+                "execution.results plus report_running_step PFM payloads in progress_log "
+                "— same signals as persist_pfm_tree_from_execution_state). "
+                "Response includes pfm_snapshot_persist.materialized=false with code/message "
+                "when bootstrap could not find nodes yet; emit report_running_step "
+                "nodes and retry publish, or call commit_pfm_snapshot for the authoritative "
+                "mindmap/EAD narrative. Canonical on-disk *.pfm / *.fmr exports for delivery "
+                "refresh are produced alongside commit workflows, not replaced by publish alone."
             ),
             "properties": {
                 "execution_id": {
@@ -701,7 +720,10 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
             "required": ["execution_id"],
         },
         handler=_publish_pfm_artifacts,
-        description="Generate and attach PFM mindmap/report artifacts for a run",
+        description=(
+            "Publish PFM .mmd/.md artifacts and try auto-persist DB snapshot "
+            "(see pfm_snapshot_persist)"
+        ),
     )
 
     def _commit_pfm_snapshot(args: dict, context: dict = None) -> str:
@@ -815,7 +837,11 @@ def register_project_tools(store: Optional[ProjectStore] = None) -> None:
                 "node_reports may omit keys that already have node_ead_report artifacts on this run "
                 "(inheritance); those are carried forward. "
                 "The committed snapshot is the single source of truth for the mindmap, persistence, "
-                "and inheritance into future runs. "
+                "and inheritance into future runs — still call this periodically even if you "
+                "already invoked publish_pfm_artifacts(). "
+                "Full per-node markdown is also mirrored into the paired .FMR delivery file at finalize; "
+                "never leave placeholder-only sections in .FMR when the report exists in node_reports[] "
+                "or chat. "
                 + PFM_HIERARCHY_READABILITY_RULES.replace("\n", " ")
                 + " "
                 + PFM_PARENT_KEY_RULES.replace("\n", " ")

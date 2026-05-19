@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,7 +45,9 @@ def _canonical_delivery_paths(execution_id: str) -> List[Path]:
     paths: List[Path] = []
     if root.is_dir():
         for pattern in _CANONICAL_GLOBS:
-            paths.extend(sorted(root.glob(pattern)))
+            for path in sorted(root.glob(pattern)):
+                if path.is_file() and _canonical_names_match_execution(path, execution_id):
+                    paths.append(path)
     paths.extend(_canonical_output_paths(execution_id))
     return sorted({p.resolve() for p in paths}, key=lambda p: str(p))
 
@@ -98,6 +101,22 @@ def _slugify_run_label(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
 
 
+def _reports_dir_has_matching_canonical(candidate: Path, execution_id: str) -> bool:
+    """True when *dir* holds a *.pfm / *.fmr file whose name references this execution."""
+    eid = str(execution_id or "").strip().lower()
+    if not eid:
+        return False
+    short = eid[:8]
+    for pattern in ("*.pfm", "*.fmr", "*.FMR"):
+        for p in candidate.glob(pattern):
+            if not p.is_file():
+                continue
+            n = p.name.lower()
+            if eid in n or (short and short in n):
+                return True
+    return False
+
+
 def discover_workspace_delivery_dirs(execution: Any) -> List[Path]:
     """
     Agents sometimes write ``projects/<run>-reports/pfm-mindmap.mmd`` in the repo
@@ -128,10 +147,11 @@ def discover_workspace_delivery_dirs(execution: Any) -> List[Path]:
             if key not in seen:
                 seen.add(key)
                 found.append(candidate)
+    eid = str(getattr(execution, "id", None) or "").strip()
     for candidate in sorted(projects_dir.glob("*-reports")):
         if not candidate.is_dir():
             continue
-        if not any((candidate / fname).is_file() for fname in _PFM_EXPORT_FILENAMES):
+        if not _reports_dir_has_matching_canonical(candidate, eid):
             continue
         key = str(candidate.resolve())
         if key not in seen:
@@ -140,10 +160,23 @@ def discover_workspace_delivery_dirs(execution: Any) -> List[Path]:
     return found
 
 
+def _canonical_names_match_execution(path: Path, execution_id: str) -> bool:
+    """Avoid copying unrelated runs from shared *-reports dirs."""
+    eid = str(execution_id or "").strip().lower()
+    if not eid:
+        return False
+    short = eid[:8]
+    n = path.name.lower()
+    return eid in n or (bool(short) and short in n)
+
+
 def ingest_workspace_delivery_exports(store: Any, execution_id: str) -> Dict[str, Any]:
     """
     Copy agent workspace exports into ``reports/<execution_id>/`` and upsert DB artifacts
     so operator Refresh can materialize the committed PFM tree.
+
+    Copies ``pfm-mindmap.mmd`` / ``pfm-report.md`` plus canonical ``*.pfm`` / ``*.fmr``
+    when filenames reference this execution id (full id or first 8 chars).
     """
     execution = store.get_execution(execution_id)
     if not execution:
@@ -154,41 +187,78 @@ def ingest_workspace_delivery_exports(store: Any, execution_id: str) -> Dict[str
     copied: List[str] = []
     now_ms = int(time.time() * 1000)
 
+    slug_dirs = {
+        str((Path(__file__).resolve().parent / f"{s}-reports").resolve())
+        for s in (
+            _slugify_run_label(str(getattr(execution, "name", "") or "")),
+            _slugify_run_label(str(getattr(execution, "id", "") or "")),
+        )
+        if s
+    }
+    if "p1" in str(getattr(execution, "name", "") or "").lower():
+        slug_dirs.add(
+            str((Path(__file__).resolve().parent / "p1-test-reports").resolve())
+        )
+
     for src_dir in discover_workspace_delivery_dirs(execution):
-        for fname in _PFM_EXPORT_FILENAMES:
-            src = src_dir / fname
-            if not src.is_file():
-                continue
-            try:
-                text = src.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
-                logger.warning("[pfm_delivery] could not read %s: %s", src, exc)
-                continue
-            dest = dest_dir / fname
-            dest.write_text(text, encoding="utf-8")
-            if fname not in copied:
-                copied.append(fname)
-            artifact_type = "pfm_mindmap" if fname.endswith(".mmd") else "pfm_report"
-            if hasattr(store, "upsert_execution_pfm_artifact"):
-                store.upsert_execution_pfm_artifact(
+        slug_associated = str(src_dir.resolve()) in slug_dirs
+        copied_this_dir: List[str] = []
+        if slug_associated:
+            for fname in _PFM_EXPORT_FILENAMES:
+                src = src_dir / fname
+                if not src.is_file():
+                    continue
+                try:
+                    text = src.read_text(encoding="utf-8", errors="replace")
+                except OSError as exc:
+                    logger.warning("[pfm_delivery] could not read %s: %s", src, exc)
+                    continue
+                dest = dest_dir / fname
+                dest.write_text(text, encoding="utf-8")
+                if fname not in copied:
+                    copied.append(fname)
+                copied_this_dir.append(fname)
+                artifact_type = "pfm_mindmap" if fname.endswith(".mmd") else "pfm_report"
+                if hasattr(store, "upsert_execution_pfm_artifact"):
+                    store.upsert_execution_pfm_artifact(
+                        execution_id,
+                        fname,
+                        artifact_type,
+                        {
+                            "artifact_key": fname,
+                            "filename": fname,
+                            "format": fname.rsplit(".", 1)[-1],
+                            "title": "PFM Mindmap" if "mindmap" in fname else "PFM Report",
+                            "content": text,
+                            "created_at": now_ms,
+                        },
+                    )
+        for pattern in ("*.pfm", "*.fmr", "*.FMR"):
+            for src in sorted(src_dir.glob(pattern)):
+                if not src.is_file() or not is_canonical_delivery_filename(src.name):
+                    continue
+                if not _canonical_names_match_execution(src, execution_id):
+                    continue
+                dest = dest_dir / src.name
+                try:
+                    shutil.copy2(src, dest)
+                except OSError as exc:
+                    logger.warning("[pfm_delivery] could not copy %s → %s: %s", src, dest, exc)
+                    continue
+                if src.name not in copied:
+                    copied.append(src.name)
+                copied_this_dir.append(src.name)
+                logger.info(
+                    "[pfm_delivery] Ingested canonical delivery file %s for %s",
+                    src.name,
                     execution_id,
-                    fname,
-                    artifact_type,
-                    {
-                        "artifact_key": fname,
-                        "filename": fname,
-                        "format": fname.rsplit(".", 1)[-1],
-                        "title": "PFM Mindmap" if "mindmap" in fname else "PFM Report",
-                        "content": text,
-                        "created_at": now_ms,
-                    },
                 )
-        if copied:
+        if copied_this_dir:
             logger.info(
                 "[pfm_delivery] Ingested workspace delivery for %s from %s: %s",
                 execution_id,
                 src_dir,
-                ", ".join(copied),
+                ", ".join(copied_this_dir),
             )
 
     return {"ok": True, "ingested": bool(copied), "files": copied}
@@ -357,6 +427,26 @@ def delivery_changed(
     return has_newer_local_delivery(prev_snap, stamp)
 
 
+def describe_canonical_delivery_locations(execution_id: str) -> str:
+    """
+    Operator hint when no canonical .pfm / .fmr / .FMR is visible on disk yet.
+    """
+    eid = str(execution_id or "").strip()
+    if not eid:
+        return ""
+    reports_exec = report_file_path(eid, PFM_REPORT_FILE).parent
+    hermes_home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    output_dir = hermes_home / "output"
+    projects_dir = Path(__file__).resolve().parent
+    return (
+        "Refresh needs canonical delivery files (*.pfm, *.fmr, *.FMR) in one of these places:\n"
+        f"  • {reports_exec}\n"
+        f"  • {output_dir} (filenames should contain this run id or its first 8 characters)\n"
+        f"  • Workspace exports under {projects_dir}/<run-slug>-reports/ are copied into the reports folder on refresh when found.\n"
+        "Export-only files (pfm-mindmap.mmd, pfm-report.md) do not count until a canonical file appears."
+    )
+
+
 def compute_canonical_delivery_stamp(execution_id: str) -> Dict[str, Any]:
     """Delivery stamp for rebuild decisions: .FMR and .pfm only (name + mtime)."""
     eid = str(execution_id or "").strip()
@@ -420,6 +510,74 @@ def _parse_fingerprint(fp: str) -> List[Dict[str, Any]]:
 def delivery_file_summary(execution_id: str) -> List[Tuple[str, int]]:
     stamp = compute_delivery_stamp(execution_id)
     return [(str(f["name"]), int(f["mtime_ms"])) for f in stamp.get("files") or []]
+
+
+def files_include_paired_pfm_fmr(files: Any) -> bool:
+    """True when both a canonical ``.pfm`` and ``.FMR`` / ``.fmr`` file are present."""
+    fmr_row, pfm_row = _canonical_rows_from_files(filter_canonical_delivery_files(files))
+    return fmr_row is not None and pfm_row is not None
+
+
+def has_paired_canonical_delivery_on_disk(execution_id: str) -> bool:
+    """Live disk check: both canonical delivery files exist for this execution."""
+    stamp = compute_canonical_delivery_stamp(execution_id)
+    return files_include_paired_pfm_fmr(stamp.get("files"))
+
+
+def snapshot_has_paired_delivery_metadata(
+    snapshot: Optional[Dict[str, Any]],
+    execution_id: str,
+) -> bool:
+    """True when snapshot records paired .pfm + .FMR delivery for this execution id."""
+    if not isinstance(snapshot, dict):
+        return False
+    eid = str(execution_id or "").strip()
+    if not eid:
+        return False
+    fmr_name = str(snapshot.get("pfm_fmr_based_on_file") or "").strip()
+    pfm_name = str(snapshot.get("pfm_pfm_based_on_file") or "").strip()
+    if fmr_name and pfm_name:
+        if not _canonical_names_match_execution(Path(fmr_name), eid):
+            return False
+        if not _canonical_names_match_execution(Path(pfm_name), eid):
+            return False
+        return True
+    files = filter_canonical_delivery_files(snapshot.get("source_delivery_files"))
+    if not files_include_paired_pfm_fmr(files):
+        return False
+    has_pfm = any(
+        str(row.get("name") or "").lower().endswith(".pfm")
+        and _canonical_names_match_execution(Path(str(row.get("name") or "")), eid)
+        for row in files
+    )
+    has_fmr = any(
+        str(row.get("name") or "").lower().endswith(".fmr")
+        and _canonical_names_match_execution(Path(str(row.get("name") or "")), eid)
+        for row in files
+    )
+    return has_pfm and has_fmr
+
+
+def execution_has_paired_canonical_delivery(
+    store: Any,
+    execution_id: str,
+    *,
+    check_disk: bool = True,
+) -> bool:
+    """
+    Operator rule for labeling **Current** EAD Feature Map:
+    this run must have delivered both ``.pfm`` and ``.FMR`` (on disk now, or recorded
+    on the committed tree snapshot after refresh). A DB tree alone is not enough.
+    """
+    eid = str(execution_id or "").strip()
+    if not eid:
+        return False
+    raw = store._get_pfm_tree_snapshot_raw(eid)
+    if snapshot_has_paired_delivery_metadata(raw, eid):
+        return True
+    if check_disk:
+        return has_paired_canonical_delivery_on_disk(eid)
+    return False
 
 
 def _canonical_rows_from_files(files: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:

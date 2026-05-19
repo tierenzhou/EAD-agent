@@ -49,6 +49,24 @@ How to improve this report next time:
 """.strip()
 
 
+PFM_FMR_DELIVERY_AGENT_INSTRUCTIONS = (
+    "**Canonical delivery — paired `.pfm` + `.FMR` (full node reports):**\n"
+    "- The operator UI and future runs rely on **full** per-node EAD reports stored in the DB "
+    "and mirrored in the run's **`.FMR`** file.\n"
+    "- **Primary path (always):** call **commit_pfm_snapshot** with complete `node_reports[]` "
+    "markdown for every new or updated `node_key` (standard structure below). That saves to the DB.\n"
+    "- **Delivery file (required at finalize):** write or update the paired **`.FMR`** under this "
+    "run's reports folder (`~/.hermes/projects/reports/<execution_id>/`) with the same full "
+    "markdown in each `#### Node EAD Report` section — **no placeholders**, no \"awaiting report\" stubs.\n"
+    "- **FMR section shape:** `## Per-Node EAD Reports` → `### Node N: <title>` → "
+    "`- Node Key: \\`<node_key>\\`` → `#### Node EAD Report` → full markdown body.\n"
+    "- If a report exists only in chat, still **commit_pfm_snapshot** (or ensure the chat reply "
+    "uses `[Node-Report-Reply-To: <node_key>]` and the standard sections) so the gateway can "
+    "recover it from progress history into the DB and `.FMR`.\n"
+    "- Do **not** rely on chat-only prose: uncommitted chat text does not populate the operator "
+    "node report panel or `.FMR`.\n"
+)
+
 PFM_NODE_REPORT_AGENT_INSTRUCTIONS = (
     "Per-node EAD reports (node_reports[] and standalone node-report replies) must be "
     "**detailed** and follow the standard structure below. Write for operators and testers "
@@ -60,6 +78,7 @@ PFM_NODE_REPORT_AGENT_INSTRUCTIONS = (
     "exploration run knows what is solid, what is missing, and how to make the report better.\n"
     "- Do not use markdown tables or # heading lines; use the exact section labels shown.\n"
     "- Scope is **this node only** — never describe child or grandchild PFM nodes here.\n\n"
-    "Standard report structure:\n"
+    + PFM_FMR_DELIVERY_AGENT_INSTRUCTIONS
+    + "\n\nStandard report structure:\n"
     + PFM_NODE_REPORT_BODY_TEMPLATE
 )
