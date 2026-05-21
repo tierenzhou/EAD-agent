@@ -12,28 +12,14 @@ its transcript from SessionDB. This avoids memory leaks from long-lived agents.
 """
 
 import asyncio
-import concurrent.futures
 import logging
 import threading
+import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from concurrent.futures import Future
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
-
-_NO_FINAL_RESPONSE_ERR = "Agent run did not complete and produced no final response."
-_CONTINUATION_USER_MESSAGE = (
-    "Continue from the last successful browser/tool state. "
-    "If login succeeded, call report_running_step with login_phase_status=success "
-    "before further exploration."
-)
-
-
-class AgentNoFinalResponseError(RuntimeError):
-    """Provider stream ended without a final assistant message."""
-
-    def __init__(self, message: str, *, recovery_attempted: bool = False):
-        super().__init__(message)
-        self.recovery_attempted = recovery_attempted
 
 
 def _coerce_message_text(content: Any) -> str:
@@ -67,87 +53,6 @@ def _dedupe_prefetched_user_turn(
     if prev == (user_message or "").strip():
         return conversation_history[:-1]
     return conversation_history
-
-
-def _is_project_session(session_key: str) -> bool:
-    return str(session_key or "").strip().startswith("eadproj-exec-")
-
-
-def _is_no_final_response_error(err: BaseException | str) -> bool:
-    lowered = str(err).strip().lower()
-    return "did not complete and produced no final response" in lowered
-
-
-def _conversation_has_recoverable_progress(history: List[Dict[str, Any]]) -> bool:
-    """True when the transcript shows recent tool/browser work worth continuing."""
-    for msg in reversed(history[-24:]):
-        role = str(msg.get("role") or "").strip().lower()
-        if role == "tool":
-            return True
-        if role == "assistant" and msg.get("tool_calls"):
-            return True
-    return False
-
-
-def _extract_run_outcome(result: Any) -> Tuple[str, bool, str]:
-    if not isinstance(result, dict):
-        return "", False, ""
-    final_response = str(result.get("final_response") or "").strip()
-    completed = bool(result.get("completed"))
-    err = str(result.get("error") or "").strip()
-    return final_response, completed, err
-
-
-def _is_truncation_error(err: str) -> bool:
-    lower_err = err.lower()
-    return "truncated due to output length limit" in lower_err or (
-        "truncated" in lower_err and "output length" in lower_err
-    )
-
-
-def _usage_from_agent(agent: Any) -> Dict[str, int]:
-    return {
-        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-    }
-
-
-def _build_user_error_message(err: BaseException) -> str:
-    raw_err = str(err).strip()
-    lowered = raw_err.lower()
-    is_credit_error = (
-        "402" in lowered
-        or "insufficient balance" in lowered
-        or "quota" in lowered
-        or "credit" in lowered
-    )
-    if is_credit_error:
-        return (
-            "⚠️ Agent execution error: model/provider call failed.\n"
-            f"Details: {raw_err[:260]}\n"
-            "Likely cause: provider credits/quota exhausted. "
-            "Please verify balance/quota and model access."
-        )
-    if _is_no_final_response_error(err):
-        recovery_attempted = isinstance(err, AgentNoFinalResponseError) and err.recovery_attempted
-        if recovery_attempted:
-            return (
-                "The provider stream was interrupted twice while the agent was working. "
-                "The gateway already asked it to continue from the last browser/tool state. "
-                "Please retry the run or switch provider/model if this keeps happening."
-            )
-        return (
-            "⚠️ Agent execution error: provider returned no final response.\n"
-            f"Details: {raw_err[:260]}\n"
-            "Likely cause: transient provider timeout/stream interruption. "
-            "Please retry the run or switch provider/model."
-        )
-    return (
-        "⚠️ Agent execution error: model/provider call failed.\n"
-        f"Details: {raw_err[:260]}\n"
-        "Please retry. If this persists, verify provider endpoint/model configuration."
-    )
 
 
 class SessionAgentPool:
@@ -220,74 +125,6 @@ class SessionAgentPool:
             pass
         return None
 
-    def _append_assistant_notice(self, session_id: str, content: str) -> None:
-        db = self._get_session_db()
-        if not db or not session_id or not content:
-            return
-        db.append_message(session_id=session_id, role="assistant", content=content)
-
-    def _result_from_outcome(
-        self,
-        result: Any,
-        agent: Any,
-        *,
-        recovered: bool = False,
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {"result": result, "usage": _usage_from_agent(agent)}
-        if recovered:
-            payload["recovered"] = True
-        return payload
-
-    def _handle_provider_error(
-        self,
-        session_key: str,
-        err: str,
-        result: Any,
-        agent: Any,
-    ) -> Optional[Dict[str, Any]]:
-        if _is_truncation_error(err):
-            logger.warning(
-                "[agent_pool] Session %s hit output truncation; deferring recovery to next turn",
-                session_key,
-            )
-            return self._result_from_outcome(result, agent)
-        raise RuntimeError(err)
-
-    def _try_recover_no_final_response(
-        self,
-        session_key: str,
-        session_id: Optional[str],
-        agent: Any,
-        conversation_history: List[Dict[str, Any]],
-        *,
-        enable_tools: bool,
-    ) -> Optional[Dict[str, Any]]:
-        if not enable_tools or not _is_project_session(session_key):
-            return None
-        if not _conversation_has_recoverable_progress(conversation_history):
-            return None
-
-        retry_history = conversation_history
-        if session_id:
-            retry_history = self._get_conversation_history(session_id)
-        retry_history = _dedupe_prefetched_user_turn(retry_history, _CONTINUATION_USER_MESSAGE)
-
-        logger.warning(
-            "[agent_pool] Recoverable provider interruption for %s; continuing once from last tool state",
-            session_key,
-        )
-        retry_result = agent.run_conversation(
-            user_message=_CONTINUATION_USER_MESSAGE,
-            conversation_history=retry_history,
-            task_id=f"eadproj:{session_key}",
-        )
-        final_response, completed, err = _extract_run_outcome(retry_result)
-        if final_response or completed:
-            return self._result_from_outcome(retry_result, agent, recovered=True)
-        if err:
-            return self._handle_provider_error(session_key, err, retry_result, agent)
-        return None
-
     def send_message(
         self,
         session_key: str,
@@ -321,25 +158,41 @@ class SessionAgentPool:
                 conversation_history=conversation_history,
                 task_id=f"eadproj:{session_key}",
             )
-            final_response, completed, err = _extract_run_outcome(result)
-            if err:
-                return self._handle_provider_error(session_key, err, result, agent)
-            if not final_response and not completed:
-                recovered = self._try_recover_no_final_response(
-                    session_key,
-                    session_id,
-                    agent,
-                    conversation_history,
-                    enable_tools=enable_tools,
-                )
-                if recovered:
-                    return recovered
-                recovery_attempted = _conversation_has_recoverable_progress(conversation_history)
-                raise AgentNoFinalResponseError(
-                    _NO_FINAL_RESPONSE_ERR,
-                    recovery_attempted=recovery_attempted,
-                )
-            return self._result_from_outcome(result, agent)
+            final_response = ""
+            completed = False
+            if isinstance(result, dict):
+                final_response = str(result.get("final_response") or "").strip()
+                completed = bool(result.get("completed"))
+                if not final_response:
+                    err = str(result.get("error") or "").strip()
+                    if err:
+                        lower_err = err.lower()
+                        # Treat provider output-length truncation as recoverable.
+                        # The executor will issue follow-up turns automatically.
+                        if "truncated due to output length limit" in lower_err or (
+                            "truncated" in lower_err and "output length" in lower_err
+                        ):
+                            logger.warning(
+                                "[agent_pool] Session %s hit output truncation; deferring recovery to next turn",
+                                session_key,
+                            )
+                            usage = {
+                                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                            }
+                            return {"result": result, "usage": usage}
+                        raise RuntimeError(err)
+                    if not completed:
+                        raise RuntimeError(
+                            "Agent run did not complete and produced no final response."
+                        )
+            usage = {
+                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+            }
+            return {"result": result, "usage": usage}
         finally:
             with self._lock:
                 self._running_agents.pop(session_key, None)
@@ -371,8 +224,45 @@ class SessionAgentPool:
             except Exception as e:
                 try:
                     sid = session_id or self._resolve_session_id(session_key)
-                    if sid:
-                        self._append_assistant_notice(sid, _build_user_error_message(e))
+                    db = self._get_session_db()
+                    if sid and db:
+                        raw_err = str(e).strip()
+                        lowered = raw_err.lower()
+                        is_credit_error = (
+                            "402" in lowered
+                            or "insufficient balance" in lowered
+                            or "quota" in lowered
+                            or "credit" in lowered
+                        )
+                        no_final_response = (
+                            "did not complete and produced no final response" in lowered
+                        )
+                        # Surface backend model/provider failures to end users with actionable guidance.
+                        if is_credit_error:
+                            user_msg = (
+                                "⚠️ Agent execution error: model/provider call failed.\n"
+                                f"Details: {raw_err[:260]}\n"
+                                "Likely cause: provider credits/quota exhausted. "
+                                "Please verify balance/quota and model access."
+                            )
+                        elif no_final_response:
+                            user_msg = (
+                                "⚠️ Agent execution error: provider returned no final response.\n"
+                                f"Details: {raw_err[:260]}\n"
+                                "Likely cause: transient provider timeout/stream interruption. "
+                                "Please retry the run or switch provider/model."
+                            )
+                        else:
+                            user_msg = (
+                                "⚠️ Agent execution error: model/provider call failed.\n"
+                                f"Details: {raw_err[:260]}\n"
+                                "Please retry. If this persists, verify provider endpoint/model configuration."
+                            )
+                        db.append_message(
+                            session_id=sid,
+                            role="assistant",
+                            content=user_msg,
+                        )
                 except Exception:
                     logger.warning(
                         "[agent_pool] Failed to append user-facing error message for session %s",
