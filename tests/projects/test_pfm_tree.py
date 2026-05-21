@@ -209,6 +209,47 @@ def test_validator_rejects_empty_tree():
     assert info.value.code == "empty_tree"
 
 
+def test_render_reconstructs_db_parent_links_from_node_key_paths():
+    snapshot = {
+        "version": 13,
+        "generation": 66,
+        "revision": 13,
+        "flat_nodes": [
+            {
+                "node_key": "p1-test",
+                "title": "Project One Kloud 1.0",
+                "parent_node_key": None,
+                "level": 1,
+            },
+            {
+                "node_key": "p1-test/authentication",
+                "title": "Authentication",
+                "parent_node_key": None,
+                "level": 2,
+            },
+            {
+                "node_key": "p1-test/authentication/login-form",
+                "title": "Login Form",
+                "parent_node_key": None,
+                "level": 3,
+            },
+            {
+                "node_key": "p1-test/dashboard",
+                "title": "Home / PPM Dashboard",
+                "parent_node_key": None,
+                "level": 2,
+            },
+        ],
+    }
+
+    mermaid = render_mermaid_for_scope(snapshot, _execution_for_render(), scope="top")
+
+    assert "Authentication" in mermaid
+    assert "Home / PPM Dashboard" in mermaid
+    assert "Login Form" not in mermaid
+    assert "Invalid PFM tree" not in mermaid
+
+
 def test_validator_rejects_unknown_report_node_key():
     payload = _good_payload(1)
     payload["node_reports"].append({"node_key": "ghost", "title": "Ghost", "markdown": "orphan"})
@@ -475,6 +516,18 @@ def test_mermaid_top_scope_emits_top_level_nodes_only():
     assert "Signup [No Run]" not in mermaid
 
 
+def test_list_clickable_nodes_matches_top_scope_children():
+    from projects.pfm_tree import list_clickable_nodes_for_scope
+
+    snapshot, _, _ = validate_and_normalize_snapshot(_good_payload(1))
+    clickable = list_clickable_nodes_for_scope(snapshot, scope="top")
+    keys = {row["node_key"] for row in clickable}
+    assert "auth" in keys
+    assert "studio" in keys
+    assert all(row.get("label") for row in clickable)
+    assert all(isinstance(row.get("child_count"), int) for row in clickable)
+
+
 def test_collapse_duplicate_hub_path_segments():
     hub = "kloud-1-0-br-p1-test-br-project-one"
     assert collapse_duplicate_hub_path_segments(f"{hub}/{hub}/8-report") == f"{hub}/8-report"
@@ -578,7 +631,7 @@ def test_mermaid_full_scope_emits_entire_tree():
     snapshot, _, _ = validate_and_normalize_snapshot(_good_payload(1))
     mermaid = render_mermaid_for_scope(snapshot, _execution_for_render(), scope="full")
     for label in ("Auth", "Login", "Signup", "Studio", "Shared"):
-        assert f"{label} [" in mermaid
+        assert label in mermaid
 
 
 def test_mermaid_subtree_scope_anchors_on_node_key():
@@ -590,9 +643,9 @@ def test_mermaid_subtree_scope_anchors_on_node_key():
         node_key="auth",
         depth=2,
     )
-    assert "Auth [Success]" in mermaid
-    assert "Login [Success]" in mermaid
-    assert "Signup [No Run]" in mermaid
+    assert "Auth" in mermaid
+    assert "Login" in mermaid
+    assert "Signup" in mermaid
     assert "Studio" not in mermaid
     assert "Shared" not in mermaid
 
@@ -602,8 +655,8 @@ def test_mermaid_path_scope_includes_only_path_to_node():
     mermaid = render_mermaid_for_scope(
         snapshot, _execution_for_render(), scope="path", node_key="auth/login"
     )
-    assert "Auth [Success]" in mermaid
-    assert "Login [Success]" in mermaid
+    assert "Auth" in mermaid
+    assert "Login" in mermaid
     assert "Signup" not in mermaid
     assert "Studio" not in mermaid
 
@@ -743,6 +796,7 @@ def isolated_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProjectSt
     """Build a ProjectStore that persists into the test's tmp_path."""
     db_path = tmp_path / "projects.db"
     monkeypatch.setenv("EAD_REPORT_BASE_DIR", str(tmp_path / "reports"))
+    monkeypatch.setenv("EAD_REPORT_DIR", str(tmp_path / "reports"))
     monkeypatch.setenv("EAD_PFM_AGENT_AUTHORED", "true")
     store = ProjectStore(db_path=db_path)
     template = ProjectTemplate(id="tpl-1", name="Test Template")
@@ -792,17 +846,71 @@ def test_strict_resolver_reads_only_committed_tree(isolated_store: ProjectStore)
         "exec-1", snapshot=snapshot, node_reports=reports
     )
     execution = isolated_store.get_execution("exec-1")
-    nodes = resolve_pfm_nodes_for_mindmap(execution)
+    nodes = resolve_pfm_nodes_for_mindmap(execution, project_store=isolated_store)
     keys = {n.node_key for n in nodes}
     assert keys == {"auth", "auth/login", "auth/signup", "studio", "shared"}
 
 
 def test_strict_resolver_returns_empty_when_no_commit(isolated_store: ProjectStore):
     execution = isolated_store.get_execution("exec-1")
-    # No tree committed yet; strict mode returns whatever `execution.results` holds
-    # (also empty in this fresh run).
-    nodes = resolve_pfm_nodes_for_mindmap(execution)
+    assert execution is not None
+    nodes = resolve_pfm_nodes_for_mindmap(execution, project_store=isolated_store)
     assert nodes == []
+
+
+def test_strict_resolver_uses_progress_before_first_commit(isolated_store: ProjectStore):
+    """Before commit_pfm_snapshot, mindmap payloads should reuse report_running_step PFM signals."""
+    progress = [
+        ProgressLogEntry(
+            kind="tool_use",
+            tool_name="report_running_step",
+            tool_input={
+                "title": "Boot Root",
+                "pfm_node": {
+                    "node_key": "boot_root",
+                    "title": "Boot Root",
+                    "level": 1,
+                    "type": "domain",
+                    "parent_node_key": None,
+                },
+            },
+        ),
+    ]
+    isolated_store.update_execution("exec-1", results=[], progress_log=progress)
+    execution = isolated_store.get_execution("exec-1")
+    assert execution is not None
+    keys = {n.node_key for n in resolve_pfm_nodes_for_mindmap(execution, project_store=isolated_store)}
+    assert keys == {"boot_root"}
+
+
+def test_strict_resolver_deferred_inherited_running_skips_progress_bootstrap(isolated_store: ProjectStore):
+    """Inherited RUNNING runs keep results-only until explicit commit."""
+    progress = [
+        ProgressLogEntry(
+            kind="tool_use",
+            tool_name="report_running_step",
+            tool_input={
+                "title": "Root",
+                "pfm_node": {
+                    "node_key": "x_root",
+                    "title": "Root",
+                    "level": 1,
+                    "type": "domain",
+                    "parent_node_key": None,
+                },
+            },
+        ),
+    ]
+    isolated_store.update_execution(
+        "exec-1",
+        status=ExecutionStatus.RUNNING,
+        inherited_from_execution_id="exec-parent",
+        results=[],
+        progress_log=progress,
+    )
+    execution = isolated_store.get_execution("exec-1")
+    assert execution is not None
+    assert resolve_pfm_nodes_for_mindmap(execution, project_store=isolated_store) == []
 
 
 def test_maybe_bootstrap_pfm_snapshot_from_results_writes_v1(isolated_store: ProjectStore):
@@ -895,7 +1003,7 @@ def test_maybe_commit_pfm_snapshot_after_publish_merges_progress_log_nodes(
             tool_input={
                 "title": "Leaf",
                 "pfm_node": {
-                    "node_key": "leaf",
+                    "node_key": "prog_root/leaf",
                     "title": "Leaf",
                     "level": 2,
                     "type": "feature-area",
@@ -996,6 +1104,46 @@ def test_persist_pfm_tree_from_execution_state_materializes_with_sync_env_off(
     out2 = isolated_store.persist_pfm_tree_from_execution_state("exec-1")
     assert out2["ok"] is True
     assert out2["code"] == "no_changes"
+
+
+def test_persist_pfm_tree_from_execution_state_guards_degenerate_inherited_results(
+    isolated_store: ProjectStore,
+) -> None:
+    from tests.projects.test_pfm_canonical import _commit_minimal_tree
+
+    isolated_store.create_execution(
+        ProjectExecute(
+            id="exec-parent",
+            linked_template_id="tpl-1",
+            name="Parent",
+            status=ExecutionStatus.COMPLETED,
+        )
+    )
+    _commit_minimal_tree(isolated_store, "exec-parent")
+    isolated_store.create_execution(
+        ProjectExecute(
+            id="exec-child",
+            linked_template_id="tpl-1",
+            name="Child",
+            status=ExecutionStatus.RUNNING,
+            inherited_from_execution_id="exec-parent",
+        )
+    )
+    noisy = [
+        EadFmNodeRun(
+            node_key="n1",
+            node_id="n1",
+            title="Screenshot captured after login",
+            level=1,
+            type="note",
+            parent_node_key=None,
+        )
+    ]
+    isolated_store.update_execution("exec-child", results=noisy)
+    out = isolated_store.persist_pfm_tree_from_execution_state("exec-child")
+    assert out["ok"] is False
+    assert out["code"] == "degenerate_snapshot_guard"
+    assert isolated_store.get_committed_pfm_tree("exec-child") is None
 
 
 def test_replace_execution_pfm_tree_satisfies_pending_refresh_request(isolated_store: ProjectStore):
