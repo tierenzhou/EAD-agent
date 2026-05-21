@@ -18,24 +18,12 @@ def _sorted_runs(store: Any, template_id: str) -> List[ProjectExecute]:
 
 
 def ensure_template_run_numbers(store: Any, template_id: str) -> None:
-    """Backfill missing run_number values without renumbering existing runs."""
+    """Assign run_number 1..N on this template (oldest first)."""
     runs = _sorted_runs(store, template_id)
-    next_number = 1
-    for ex in runs:
-        existing = int(getattr(ex, "run_number", 0) or 0)
-        if existing > 0:
-            next_number = max(next_number, existing + 1)
+    for idx, ex in enumerate(runs, start=1):
+        if int(getattr(ex, "run_number", 0) or 0) == idx:
             continue
-        store.update_execution(ex.id, run_number=next_number)
-        next_number += 1
-
-
-def next_run_number(store: Any, template_id: str) -> int:
-    """Allocate the next persistent run_number for a new run."""
-    highest = 0
-    for ex in _sorted_runs(store, template_id):
-        highest = max(highest, int(getattr(ex, "run_number", 0) or 0))
-    return highest + 1
+        store.update_execution(ex.id, run_number=idx)
 
 
 def get_run_number(store: Any, ex: ProjectExecute) -> int:

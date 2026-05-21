@@ -82,32 +82,3 @@ def test_get_active_executions_excludes_reporting_closed(reporting_store: Projec
     assert active.id in active_ids
     assert closed.id not in active_ids
 
-
-def test_close_other_active_executions_is_global(reporting_store: ProjectStore):
-    reporting_store.create_template(ProjectTemplate(id="tpl-other", name="Other"))
-    first = reporting_store.create_execution(
-        _mk_exec("exec-first", 1_000, status=ExecutionStatus.RUNNING)
-    )
-    second = ProjectExecute(
-        id="exec-second",
-        linked_template_id="tpl-other",
-        name="exec-second",
-        status=ExecutionStatus.PENDING,
-        start_time=2_000,
-        valid_for_data_reporting_training=True,
-        contributes_to_learning=True,
-    )
-    reporting_store.create_execution(second)
-
-    closed_ids = reporting_store.close_other_active_executions(second.id)
-
-    assert first.id in closed_ids
-    assert reporting_store.get_execution(first.id).status == ExecutionStatus.CANCELLED
-    assert (
-        reporting_store.get_execution(first.id).reporting_activity_status
-        == ReportingActivityStatus.CLOSED
-    )
-    assert [execution.id for execution in reporting_store.get_active_executions()] == [
-        second.id
-    ]
-

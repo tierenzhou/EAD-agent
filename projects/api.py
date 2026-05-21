@@ -18,12 +18,8 @@ import re
 import shutil
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
-
-# Dedicated pool so project DB/render work cannot starve the default executor or block /health.
-_PROJECT_API_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="projects-api")
+from typing import Any, Dict, List, Optional, Union
 
 _RUN_PURPOSE_ALLOWED = frozenset({"live_app_learning", "live_app_testing", "document_analysis"})
 _EVIDENCE_SOURCE_ALLOWED = frozenset({"live_app", "document", "hybrid"})
@@ -259,23 +255,8 @@ def _execution_list_item_dict(
     prompt = str(raw.get("ai_prompt") or "")
     if len(prompt) > 800:
         raw["ai_prompt"] = prompt[:800] + "\n...(truncated in list view)"
-    if store is not None:
-        active_chat_id = str(store.get_active_chat_delivery_execution_id() or "").strip()
-        row_id = str(raw.get("id") or "").strip()
-        raw["chat_delivery_active"] = bool(active_chat_id and row_id == active_chat_id)
-        if not isinstance(execution, dict):
-            raw.update(store.resolve_pfm_lineage_context(execution))
-        else:
-            # Keep list views cheap. Full lineage resolution can traverse large
-            # execution payloads and PFM snapshots; the detail endpoint handles that.
-            run_number = raw.get("run_number")
-            raw.setdefault("pfm_generation_version", run_number)
-            raw.setdefault("pfm_lineage_version", run_number)
-            raw.setdefault("pfm_revision", 0)
-            raw.setdefault("pfm_step_version", 0)
-            raw.setdefault("pfm_finalized", False)
-            raw.setdefault("pfm_has_committed_snapshot", False)
-            raw.setdefault("pfm_snapshot_phase", "summary")
+    if store is not None and not isinstance(execution, dict):
+        raw.update(store.resolve_pfm_lineage_context(execution))
     return _to_camel_dict(raw)
 
 
@@ -283,10 +264,6 @@ def _execution_detail_dict(store: "ProjectStore", execution: ProjectExecute) -> 
     """Full execution payload for GET + UI, including PFM lineage flags."""
     raw = json.loads(execution.model_dump_json())
     raw.update(store.resolve_pfm_lineage_context(execution))
-    active_chat_id = str(store.get_active_chat_delivery_execution_id() or "").strip()
-    raw["chat_delivery_active"] = bool(
-        active_chat_id and str(execution.id or "").strip() == active_chat_id
-    )
     return _to_camel_dict(raw)
 
 try:
@@ -335,7 +312,7 @@ def _build_phase1_canonical_baseline_message(
     One authoritative Phase-1 baseline for agents: persisted PFM nodes, mindmap excerpt,
     and per-node EAD reports so Initialization (post-login) can reconcile accurately.
     """
-    nodes = resolve_pfm_nodes_for_mindmap(execution, project_store=store)
+    nodes = resolve_pfm_nodes_for_mindmap(execution)
     artifacts = store.list_execution_pfm_artifacts(execution.id)
     committed_tree = store.get_committed_pfm_tree(execution.id)
 
@@ -740,15 +717,6 @@ class ProjectHandlers:
         self._executor = executor
         self._fmr_sync_inflight: set[str] = set()
 
-    async def _run_blocking(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-        loop = asyncio.get_running_loop()
-        if kwargs:
-            return await loop.run_in_executor(
-                _PROJECT_API_EXECUTOR,
-                lambda: fn(*args, **kwargs),
-            )
-        return await loop.run_in_executor(_PROJECT_API_EXECUTOR, fn, *args)
-
     def _schedule_execution_bootstrap(self, execution_id: str) -> None:
         from projects.run_bootstrap import run_execution_bootstrap
 
@@ -790,86 +758,6 @@ class ProjectHandlers:
                 self._fmr_sync_inflight.discard(eid)
 
         loop.create_task(_runner())
-
-    def _resolve_pfm_read_execution_ids(
-        self, execution: ProjectExecute
-    ) -> tuple[str, str, bool]:
-        """
-        Resolve which execution's committed tree should be shown right now.
-
-        Returns (read_execution_id, baseline_execution_id, has_own_committed).
-        """
-        eid = str(getattr(execution, "id", "") or "").strip()
-        if not eid:
-            return "", "", False
-
-        read_id = ""
-        baseline_id = ""
-        display_mode = ""
-        has_own_delivery = False
-        try:
-            if hasattr(self._store, "resolve_pfm_lineage_context"):
-                ctx = self._store.resolve_pfm_lineage_context(execution) or {}
-                read_id = str(ctx.get("pfm_tree_read_execution_id") or "").strip()
-                baseline_id = str(ctx.get("pfm_baseline_execution_id") or "").strip()
-                display_mode = str(ctx.get("pfm_map_display_mode") or "").strip().lower()
-                has_own_delivery = bool(ctx.get("has_delivered_pfm_map_report"))
-        except Exception:
-            read_id = ""
-            baseline_id = ""
-            display_mode = ""
-            has_own_delivery = False
-
-        # Simple rule: Current only means this run delivered its own PFM map/report.
-        # A committed tree on the current run may be an inherited/bootstrap copy and
-        # must not override the Previous EAD Feature Map.
-        if display_mode == "current" or has_own_delivery:
-            return eid, eid, True
-
-        if not baseline_id and hasattr(self._store, "resolve_pfm_baseline_execution_id"):
-            try:
-                baseline_id = str(self._store.resolve_pfm_baseline_execution_id(execution) or "").strip()
-            except Exception:
-                baseline_id = ""
-
-        if not read_id:
-            read_id = baseline_id or eid
-        if not baseline_id:
-            baseline_id = read_id
-        return read_id, baseline_id, False
-
-    def _resolve_snapshot_with_fallback(
-        self, execution: ProjectExecute
-    ) -> tuple[Optional[Dict[str, Any]], str, str, bool]:
-        """
-        Snapshot for rendering:
-        - own committed tree when present
-        - otherwise baseline/read execution committed tree if available
-        """
-        read_id, baseline_id, has_own = self._resolve_pfm_read_execution_ids(execution)
-        if has_own:
-            snap = self._store.get_committed_pfm_tree(execution.id)
-            return snap, str(execution.id), baseline_id, True
-        if read_id and read_id != str(execution.id):
-            snap = self._store.get_committed_pfm_tree(read_id)
-            return snap, read_id, baseline_id, False
-        return None, str(execution.id), baseline_id, False
-
-    def _augment_focus_snapshot_from_node_reports(
-        self,
-        snapshot: Dict[str, Any],
-        *,
-        read_execution_id: str,
-        node_key: Optional[str],
-    ) -> Dict[str, Any]:
-        from .pfm_hierarchy import augment_focus_snapshot_from_node_reports
-
-        return augment_focus_snapshot_from_node_reports(
-            snapshot,
-            read_execution_id=read_execution_id,
-            node_key=node_key,
-            list_artifacts_fn=self._store.list_execution_pfm_artifacts,
-        )
 
     # ------------------------------------------------------------------
     # Template endpoints
@@ -943,9 +831,9 @@ class ProjectHandlers:
         template_id: str,
         preferred_execution_id: str,
     ) -> None:
-        if not preferred_execution_id:
+        if not template_id:
             return
-        runs = list(self._store.get_active_executions() or [])
+        runs = list(self._store.list_executions(template_id=template_id) or [])
         for run in runs:
             if run.id == preferred_execution_id:
                 continue
@@ -959,7 +847,7 @@ class ProjectHandlers:
                         operator_stop_kind="cancel",
                         cancel_reason=(
                             "Closed automatically: only one active run is allowed "
-                            "globally for gateway reliability."
+                            "per template for reporting and knowledge retrieval."
                         ),
                     )
                 else:
@@ -970,7 +858,7 @@ class ProjectHandlers:
                         operator_stop_kind="cancel",
                         cancel_reason=(
                             "Closed automatically: only one active run is allowed "
-                            "globally for gateway reliability."
+                            "per template for reporting and knowledge retrieval."
                         ),
                     )
             self._store.set_execution_reporting_activity(run.id, active=False)
@@ -980,20 +868,18 @@ class ProjectHandlers:
     async def handle_list_executions(self, request: "web.Request") -> "web.Response":
         template_id = request.query.get("template_id")
         status = request.query.get("status")
-
-        def _build_list_response() -> Dict[str, Any]:
-            execution_payloads = self._store.list_execution_payloads(
-                template_id=template_id or None,
-                status=status or None,
-            )
-            return {
-                "executions": [_execution_list_item_dict(e, self._store) for e in execution_payloads],
+        execution_payloads = self._store.list_execution_payloads(
+            template_id=template_id or None,
+            status=status or None,
+        )
+        return _json_response(
+            {
+                "executions": [_execution_list_item_dict(e, None) for e in execution_payloads],
             }
+        )
 
-        payload = await self._run_blocking(_build_list_response)
-        return _json_response(payload)
-
-    def _get_execution_response(self, execution_id: str) -> "web.Response":
+    async def handle_get_execution(self, request: "web.Request") -> "web.Response":
+        execution_id = request.match_info["execution_id"]
         execution = self._store.get_execution(execution_id)
         if not execution:
             return _error_response(f"Execution {execution_id} not found", 404, "not_found")
@@ -1014,10 +900,6 @@ class ProjectHandlers:
             except Exception as exc:
                 logger.warning("[projects] Failed to persist recovered screenshots for %s: %s", execution_id, exc)
         return _json_response(_execution_detail_dict(self._store, execution))
-
-    async def handle_get_execution(self, request: "web.Request") -> "web.Response":
-        execution_id = request.match_info["execution_id"]
-        return await self._run_blocking(self._get_execution_response, execution_id)
 
     async def handle_run_execution(self, request: "web.Request") -> "web.Response":
         try:
@@ -1139,20 +1021,37 @@ class ProjectHandlers:
         else:
             active = bool(active_raw)
 
+        if not active:
+            raw_status = getattr(execution, "status", "")
+            status = str(getattr(raw_status, "value", raw_status) or "").strip().lower()
+            if status in (ExecutionStatus.RUNNING.value, ExecutionStatus.PENDING.value):
+                reason = (
+                    "Closed by operator for reporting/knowledge retrieval. "
+                    "Run auto-stopped to enforce single active run."
+                )
+                if self._executor:
+                    await self._executor.cancel_execution(
+                        execution_id,
+                        final_status=ExecutionStatus.CANCELLED,
+                        operator_stop_kind="cancel",
+                        cancel_reason=reason,
+                    )
+                else:
+                    self._store.update_execution(
+                        execution_id,
+                        status=ExecutionStatus.CANCELLED,
+                        paused=False,
+                        operator_stop_kind="cancel",
+                        cancel_reason=reason,
+                    )
+
         updated = self._store.set_execution_reporting_activity(execution_id, active=active)
         if not updated:
             return _error_response(f"Execution {execution_id} not found", 404, "not_found")
 
-        template_active_id = self._store.get_active_reporting_execution_id(
-            updated.linked_template_id
-        )
-        active_chat_id = self._store.get_active_chat_delivery_execution_id()
+        template_active_id = self._store.get_active_reporting_execution_id(updated.linked_template_id)
         out = _to_camel_dict(json.loads(updated.model_dump_json()))
         out["activeReportingExecutionId"] = template_active_id
-        out["activeChatDeliveryExecutionId"] = active_chat_id
-        out["chatDeliveryActive"] = bool(
-            active_chat_id and str(updated.id or "").strip() == str(active_chat_id or "").strip()
-        )
         return _json_response(out)
 
     async def handle_cancel_execution(self, request: "web.Request") -> "web.Response":
@@ -1183,19 +1082,6 @@ class ProjectHandlers:
             )
             updated = self._store.update_execution(execution_id, duration_ms=duration_ms)
         else:
-            if final_status == ExecutionStatus.COMPLETED:
-                allowed = bool(self._store.get_committed_pfm_tree(execution_id))
-                if not allowed:
-                    out = self._store.persist_pfm_tree_from_execution_state(execution_id)
-                    allowed = bool(out.get("ok")) and str(out.get("code") or "").strip() == "materialized"
-                if not allowed:
-                    final_status = ExecutionStatus.CANCELLED
-                    base = str(cancel_reason or "").strip()
-                    cancel_reason = (
-                        f"{base}; completion_blocked:missing_committed_pfm_tree"
-                        if base
-                        else "completion_blocked:missing_committed_pfm_tree"
-                    )
             updated = self._store.update_execution(
                 execution_id,
                 status=final_status,
@@ -1204,7 +1090,6 @@ class ProjectHandlers:
                 cancel_reason=cancel_reason,
                 duration_ms=duration_ms,
             )
-        self._store.set_execution_reporting_activity(execution_id, active=False)
 
         logger.info("[projects] Cancelled execution %s (kind=%s)", execution_id, stop_kind)
         raw = json.loads(updated.model_dump_json())
@@ -1289,21 +1174,18 @@ class ProjectHandlers:
         content_type, _ = mimetypes.guess_type(str(target))
         return web.FileResponse(path=target, headers={"Content-Type": content_type or "text/plain"})
 
-    def _get_node_report_artifact_response(
-        self, execution_id: str, node_key: str
-    ) -> "web.Response":
-        from .pfm_node_report_resolve import resolve_node_ead_report_artifact
+    async def handle_get_node_report_artifact(self, request: "web.Request") -> "web.Response":
+        from .pfm_tree import node_report_artifact_key
 
+        execution_id = request.match_info["execution_id"]
         execution = self._store.get_execution(execution_id)
         if not execution:
             return _error_response(f"Execution {execution_id} not found", 404, "not_found")
-        nk = str(node_key or "").strip()
-        if not nk:
+        node_key = (request.query.get("node_key") or request.query.get("nodeKey") or "").strip()
+        if not node_key:
             return _error_response("node_key is required")
-
-        artifact = resolve_node_ead_report_artifact(
-            self._store, execution_id, nk, hydrate=True
-        )
+        artifact_key = node_report_artifact_key(node_key)
+        artifact = self._store.get_execution_pfm_artifact(execution_id, artifact_key)
         snapshot = self._store.get_committed_pfm_tree(execution_id)
         tree_version = int((snapshot or {}).get("version") or 0)
         tree_generated_at = int((snapshot or {}).get("generated_at") or 0)
@@ -1311,7 +1193,7 @@ class ProjectHandlers:
             return _json_response(
                 {
                     "executionId": execution_id,
-                    "nodeKey": nk,
+                    "nodeKey": node_key,
                     "artifact": None,
                     "pfmTreeVersion": tree_version,
                     "pfmTreeGeneratedAt": tree_generated_at,
@@ -1320,22 +1202,13 @@ class ProjectHandlers:
         return _json_response(
             {
                 "executionId": execution_id,
-                "nodeKey": nk,
+                "nodeKey": node_key,
                 "artifact": _to_camel_dict(artifact),
                 "pfmTreeVersion": tree_version,
                 "pfmTreeGeneratedAt": tree_generated_at,
                 "isStale": tree_generated_at > 0
-                and int(artifact.get("created_at") or 0) < tree_generated_at,
+                    and int(artifact.get("created_at") or 0) < tree_generated_at,
             }
-        )
-
-    async def handle_get_node_report_artifact(self, request: "web.Request") -> "web.Response":
-        execution_id = request.match_info["execution_id"]
-        node_key = (request.query.get("node_key") or request.query.get("nodeKey") or "").strip()
-        return await self._run_blocking(
-            self._get_node_report_artifact_response,
-            execution_id,
-            node_key,
         )
 
     async def handle_save_node_report_artifact(self, request: "web.Request") -> "web.Response":
@@ -1371,7 +1244,8 @@ class ProjectHandlers:
     # Agent-authored PFM tree endpoints (commit_pfm_snapshot pipeline)
     # ------------------------------------------------------------------
 
-    def _get_pfm_tree_response(self, execution_id: str) -> "web.Response":
+    async def handle_get_pfm_tree(self, request: "web.Request") -> "web.Response":
+        execution_id = request.match_info["execution_id"]
         execution = self._store.get_execution(execution_id)
         if not execution:
             return _error_response(f"Execution {execution_id} not found", 404, "not_found")
@@ -1397,22 +1271,18 @@ class ProjectHandlers:
             }
         )
 
-    async def handle_get_pfm_tree(self, request: "web.Request") -> "web.Response":
-        execution_id = request.match_info["execution_id"]
-        return await self._run_blocking(self._get_pfm_tree_response, execution_id)
-
-    def _get_pfm_persisted_state_response(
-        self, execution_id: str, summaries_only: bool
-    ) -> "web.Response":
+    async def handle_get_pfm_persisted_state(self, request: "web.Request") -> "web.Response":
         """Return DB-backed canonical PFM tree + all node EAD reports for this execution (read-only)."""
+        execution_id = request.match_info["execution_id"]
         execution = self._store.get_execution(execution_id)
         if not execution:
             return _error_response(f"Execution {execution_id} not found", 404, "not_found")
 
-        snapshot, read_execution_id, baseline_execution_id, has_own_committed = (
-            self._resolve_snapshot_with_fallback(execution)
-        )
+        snapshot = self._store.get_committed_pfm_tree(execution_id)
         node_reports: List[Dict[str, Any]] = []
+        summaries_only = str(
+            request.query.get("summaries_only") or request.query.get("summariesOnly") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
         for art in self._store.list_execution_pfm_artifacts(execution_id):
             if str(art.get("artifact_type") or "") != "node_ead_report":
                 continue
@@ -1429,87 +1299,12 @@ class ProjectHandlers:
                 row["content"] = content
             node_reports.append(row)
 
-        if (not node_reports) and read_execution_id and read_execution_id != execution_id:
-            for art in self._store.list_execution_pfm_artifacts(read_execution_id):
-                if str(art.get("artifact_type") or "") != "node_ead_report":
-                    continue
-                content = str(art.get("content") or "")
-                row = {
-                    "node_key": str(art.get("node_key") or "").strip(),
-                    "artifact_key": str(art.get("artifact_key") or "").strip(),
-                    "title": str(art.get("title") or "").strip(),
-                    "created_at": art.get("created_at"),
-                    "excerpt": str(art.get("excerpt") or "")[:800],
-                    "content_length": len(content),
-                    "source_execution_id": read_execution_id,
-                }
-                if not summaries_only:
-                    row["content"] = content
-                node_reports.append(row)
-
         payload = {
             "execution_id": execution_id,
-            "read_execution_id": read_execution_id,
-            "baseline_execution_id": baseline_execution_id,
-            "has_own_committed_snapshot": has_own_committed,
             "committed_snapshot": snapshot,
             "node_reports": node_reports,
         }
         return _json_response(_to_camel_dict(payload))
-
-    async def handle_get_pfm_persisted_state(self, request: "web.Request") -> "web.Response":
-        execution_id = request.match_info["execution_id"]
-        summaries_only = str(
-            request.query.get("summaries_only") or request.query.get("summariesOnly") or ""
-        ).strip().lower() in ("1", "true", "yes", "on")
-        return await self._run_blocking(
-            self._get_pfm_persisted_state_response,
-            execution_id,
-            summaries_only,
-        )
-
-    async def handle_post_pfm_backfill(self, request: "web.Request") -> "web.Response":
-        """Bulk backfill finished runs: delivery refresh, FMR sync, hierarchy reconcile."""
-        body: Dict[str, Any] = {}
-        if request.can_read_body:
-            try:
-                body = _to_snake_dict(await request.json())
-            except Exception:
-                body = {}
-
-        dry_run = body.get("dry_run") in (True, "true", 1, "1")
-        try:
-            limit = int(body.get("limit") or 50)
-        except Exception:
-            limit = 50
-        limit = max(1, min(limit, 500))
-        cursor = str(body.get("cursor") or "").strip()
-        promote = body.get("promote_template_canonical") in (True, "true", 1, "1")
-
-        from .pfm_backfill import run_pfm_backfill
-
-        try:
-            result = await asyncio.to_thread(
-                run_pfm_backfill,
-                self._store,
-                dry_run=dry_run,
-                limit=limit,
-                cursor=cursor,
-                promote_template_canonical=promote,
-            )
-        except Exception as exc:
-            logger.exception("[projects] pfm backfill failed")
-            return _json_response(
-                _to_camel_dict(
-                    {
-                        "ok": False,
-                        "code": "error",
-                        "message": str(exc)[:240],
-                    }
-                ),
-                status=500,
-            )
-        return _json_response(_to_camel_dict(result))
 
     async def handle_post_pfm_request_snapshot(self, request: "web.Request") -> "web.Response":
         """Refresh PFM from disk: rebuild DB only when .FMR/.pfm are newer than the committed baseline."""
@@ -1540,6 +1335,9 @@ class ProjectHandlers:
                     promote_template_canonical=False,
                 )
             )
+            if delivery_result.get("ok") is True and delivery_result.get("code") != "no_delivery_files":
+                # Keep Refresh responsive: import per-node reports from .FMR asynchronously.
+                self._schedule_fmr_node_report_sync(execution_id)
             delivery_result["execution_id"] = execution_id
             return _json_response(_to_camel_dict(delivery_result))
 
@@ -1565,24 +1363,22 @@ class ProjectHandlers:
         raw["execution_id"] = execution_id
         return _json_response(_to_camel_dict(raw))
 
-    def _get_pfm_mindmap_response(
-        self,
-        execution_id: str,
-        scope: str,
-        node_key: Optional[str],
-        depth: Optional[int],
-    ) -> "web.Response":
-        from .pfm_tree import list_clickable_nodes_for_scope, render_mermaid_for_scope
+    async def handle_get_pfm_mindmap(self, request: "web.Request") -> "web.Response":
+        from .pfm_tree import render_mermaid_for_scope
 
+        execution_id = request.match_info["execution_id"]
         execution = self._store.get_execution(execution_id)
         if not execution:
             return _error_response(f"Execution {execution_id} not found", 404, "not_found")
 
-        snapshot, read_execution_id, baseline_execution_id, has_own_committed = (
-            self._resolve_snapshot_with_fallback(execution)
-        )
-        source_execution = self._store.get_execution(read_execution_id) if read_execution_id else execution
-        source_run_number = int(getattr(source_execution, "run_number", 0) or 0) if source_execution else 0
+        snapshot = self._store.get_committed_pfm_tree(execution_id)
+        scope = request.query.get("scope", "top")
+        node_key = request.query.get("node_key") or request.query.get("nodeKey")
+        depth_raw = request.query.get("depth")
+        try:
+            depth = int(depth_raw) if depth_raw is not None else None
+        except Exception:
+            depth = None
 
         if not snapshot:
             mermaid = (
@@ -1599,34 +1395,16 @@ class ProjectHandlers:
                     "version": 0,
                     "generatedAt": 0,
                     "mermaid": mermaid,
-                    "clickableNodes": [],
                     "committed": False,
-                    "readExecutionId": execution_id,
-                    "baselineExecutionId": baseline_execution_id or None,
-                    "sourceExecutionId": execution_id,
-                    "sourceRunNumber": int(getattr(execution, "run_number", 0) or 0) or None,
                 }
             )
 
-        effective_snapshot = snapshot
-        if str(scope or "").strip().lower() == "focus" and node_key:
-            effective_snapshot = self._augment_focus_snapshot_from_node_reports(
-                snapshot,
-                read_execution_id=str(read_execution_id or execution_id),
-                node_key=node_key,
-            )
-
         mermaid = render_mermaid_for_scope(
-            effective_snapshot,
+            snapshot,
             execution,
             scope=scope,
             node_key=node_key,
             depth=depth,
-        )
-        clickable_nodes = list_clickable_nodes_for_scope(
-            effective_snapshot,
-            scope=scope,
-            node_key=node_key,
         )
         return _json_response(
             {
@@ -1637,30 +1415,8 @@ class ProjectHandlers:
                 "version": int(snapshot.get("version") or 0),
                 "generatedAt": int(snapshot.get("generated_at") or 0),
                 "mermaid": mermaid,
-                "clickableNodes": [_to_camel_dict(n) for n in clickable_nodes],
-                "committed": has_own_committed,
-                "readExecutionId": read_execution_id,
-                "baselineExecutionId": baseline_execution_id or None,
-                "sourceExecutionId": read_execution_id,
-                "sourceRunNumber": source_run_number or None,
+                "committed": True,
             }
-        )
-
-    async def handle_get_pfm_mindmap(self, request: "web.Request") -> "web.Response":
-        execution_id = request.match_info["execution_id"]
-        scope = request.query.get("scope", "top")
-        node_key = request.query.get("node_key") or request.query.get("nodeKey")
-        depth_raw = request.query.get("depth")
-        try:
-            depth = int(depth_raw) if depth_raw is not None else None
-        except Exception:
-            depth = None
-        return await self._run_blocking(
-            self._get_pfm_mindmap_response,
-            execution_id,
-            scope,
-            node_key,
-            depth,
         )
 
     async def handle_get_pfm_view(self, request: "web.Request") -> "web.Response":
@@ -1670,9 +1426,7 @@ class ProjectHandlers:
         execution = self._store.get_execution(execution_id)
         if not execution:
             return _error_response(f"Execution {execution_id} not found", 404, "not_found")
-        snapshot, read_execution_id, baseline_execution_id, has_own_committed = (
-            self._resolve_snapshot_with_fallback(execution)
-        )
+        snapshot = self._store.get_committed_pfm_tree(execution_id)
         saved = self._store.get_pfm_view_state(execution_id)
         if snapshot:
             repaired = apply_view_state_to_tree(saved, snapshot)
@@ -1688,9 +1442,6 @@ class ProjectHandlers:
         return _json_response(
             {
                 "executionId": execution_id,
-                "readExecutionId": read_execution_id,
-                "baselineExecutionId": baseline_execution_id or None,
-                "hasOwnCommitted": has_own_committed,
                 "state": _to_camel_dict(repaired),
             }
         )
@@ -1801,7 +1552,6 @@ class ProjectHandlers:
             "/v1/projects/executions/{execution_id}/pfm/request-snapshot",
             self.handle_post_pfm_request_snapshot,
         )
-        app.router.add_post("/v1/projects/pfm/backfill", self.handle_post_pfm_backfill)
         app.router.add_get(
             "/v1/projects/executions/{execution_id}/pfm/mindmap",
             self.handle_get_pfm_mindmap,

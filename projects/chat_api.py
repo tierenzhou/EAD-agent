@@ -26,15 +26,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-_TERMINAL_EXECUTION_STATUSES = frozenset(
-    {
-        "completed",
-        "failed",
-        "cancelled",
-        "error",
-    }
-)
-
 
 def _json_response(data: Any, status: int = 200) -> "web.Response":
     return web.json_response(data, status=status)
@@ -61,42 +52,17 @@ class ChatControlHandlers:
         execution_id = key[len(prefix):].strip()
         return execution_id or None
 
-    def _execution_for_session_key(self, session_key: str):
+    def _is_closed_reporting_run(self, session_key: str) -> bool:
         execution_id = self._execution_id_from_session_key(session_key)
         if not execution_id or self._project_store is None:
-            return None
-        try:
-            return self._project_store.get_execution(execution_id)
-        except Exception:
-            return None
-
-    def _execution_status_value(self, execution) -> str:
-        if execution is None:
-            return ""
-        raw_status = getattr(execution, "status", "")
-        return str(getattr(raw_status, "value", raw_status) or "").strip().lower()
-
-    def _is_terminal_execution(self, execution) -> bool:
-        return self._execution_status_value(execution) in _TERMINAL_EXECUTION_STATUSES
-
-    def _terminal_run_blocks_live_chat(self, session_key: str) -> bool:
-        """Finished project runs are read-only for agent delivery; history stays available."""
-        execution = self._execution_for_session_key(session_key)
-        if execution is None:
             return False
-        return self._is_terminal_execution(execution)
-
-    def _auto_activate_project_chat_delivery(self, session_key: str) -> Optional[str]:
-        execution_id = self._execution_id_from_session_key(session_key)
-        if not execution_id or self._project_store is None:
-            return execution_id
         try:
-            updated = self._project_store.set_execution_reporting_activity(
-                execution_id, active=True
-            )
-            return str(getattr(updated, "id", "") or "").strip() or None
+            ex = self._project_store.get_execution(execution_id)
+            if not ex:
+                return False
+            return str(getattr(ex, "reporting_activity_status", "") or "").strip().lower() == "closed"
         except Exception:
-            return None
+            return False
 
     def _get_session_db(self):
         if self._session_db is not None:
@@ -122,6 +88,13 @@ class ChatControlHandlers:
 
         if not session_key:
             return _error_response("session_key is required")
+        if self._is_closed_reporting_run(session_key):
+            return _error_response(
+                "This run is closed for reporting/knowledge retrieval; chat is disabled.",
+                409,
+                "run_closed",
+            )
+
         db = self._get_session_db()
 
         session_id = self._resolve_session_id(db, session_key)
@@ -155,12 +128,13 @@ class ChatControlHandlers:
             return _error_response("session_key is required")
         if not content:
             return _error_response("content is required")
-        if deliver and self._terminal_run_blocks_live_chat(session_key):
+        if self._is_closed_reporting_run(session_key):
             return _error_response(
-                "This run is finished; chat history is read-only.",
+                "This run is closed for reporting/knowledge retrieval; chat is disabled.",
                 409,
                 "run_closed",
             )
+
         if idempotency_key:
             if idempotency_key in self._idempotency_cache:
                 return _json_response(
@@ -203,14 +177,6 @@ class ChatControlHandlers:
 
         # Project runs need browser/report tools when the operator replies (e.g. login credentials).
         enable_tools = str(session_key or "").startswith("eadproj-exec-")
-        if enable_tools:
-            activated_execution_id = self._auto_activate_project_chat_delivery(session_key)
-            if not activated_execution_id:
-                return _error_response(
-                    "This run cannot be activated for live chat/delivery.",
-                    409,
-                    "activation_failed",
-                )
 
         db.append_message(
             session_id=session_id,
@@ -396,6 +362,13 @@ class ChatControlHandlers:
 
         if not session_key:
             return _error_response("session_key is required")
+        if self._is_closed_reporting_run(session_key):
+            return _error_response(
+                "This run is closed for reporting/knowledge retrieval; chat sessions are disabled.",
+                409,
+                "run_closed",
+            )
+
         db = self._get_session_db()
         session_id = self._resolve_session_id(db, session_key)
 
@@ -406,13 +379,6 @@ class ChatControlHandlers:
                     "session_key": session_key,
                     "created": False,
                 }
-            )
-
-        if self._terminal_run_blocks_live_chat(session_key):
-            return _error_response(
-                "This run is finished; chat history is read-only.",
-                409,
-                "run_closed",
             )
 
         session_id = self._create_project_session(db, session_key, display_name=display_name)

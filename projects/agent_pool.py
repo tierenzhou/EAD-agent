@@ -90,7 +90,6 @@ class SessionAgentPool:
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
-                enabled_toolsets=enabled_toolsets,
             )
 
         from run_agent import AIAgent

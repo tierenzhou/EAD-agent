@@ -56,7 +56,7 @@ def generate_pfm_deliverables(store, execution_id: str) -> List[ProjectReportArt
     backfill_node_reports_from_progress_log(store, execution_id)
 
     template = store.get_template(execution.linked_template_id)
-    nodes = resolve_pfm_nodes_for_mindmap(execution, project_store=store)
+    nodes = resolve_pfm_nodes_for_mindmap(execution)
     artifacts = store.list_execution_pfm_artifacts(execution.id)
     node_reports: List[Dict[str, Any]] = []
     for artifact in artifacts:
@@ -267,48 +267,6 @@ def _build_fmr_markdown(
             )
 
     return "\n".join(lines).rstrip() + "\n"
-
-
-def rewrite_canonical_fmr_from_store(store, execution_id: str) -> bool:
-    """
-    Rewrite the canonical ``*.FMR`` file from DB ``node_ead_report`` artifacts.
-
-    Lightweight companion to :func:`generate_pfm_deliverables` (no PDF regeneration).
-  Used after FMR/progress_log backfill so on-disk delivery matches the DB.
-    """
-    execution = store.get_execution(execution_id)
-    if not execution:
-        return False
-
-    from .pfm_node_report_content import normalize_node_report_markdown
-
-    template = store.get_template(execution.linked_template_id)
-    nodes = resolve_pfm_nodes_for_mindmap(execution, project_store=store)
-    node_reports: List[Dict[str, Any]] = []
-    for artifact in store.list_execution_pfm_artifacts(execution.id) or []:
-        if str(artifact.get("artifact_type") or "") != "node_ead_report":
-            continue
-        node_key = str(artifact.get("node_key") or "").strip()
-        content = normalize_node_report_markdown(
-            str(artifact.get("content") or artifact.get("markdown") or "")
-        )
-        if not node_key or not content:
-            continue
-        row = dict(artifact)
-        row["node_key"] = node_key
-        row["content"] = content
-        node_reports.append(row)
-
-    base_name = _export_base_name(template.name if template else execution.name, execution.id)
-    out_dir = reports_root_dir() / execution.id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fmr_path = out_dir / f"{base_name}.FMR"
-    fmr_path.write_text(
-        _build_fmr_markdown(execution, template, nodes, node_reports),
-        encoding="utf-8",
-    )
-    logger.info("[pfm_deliverables] Rewrote canonical FMR for %s (%s nodes)", execution_id, len(node_reports))
-    return True
 
 
 def _write_pfm_pdf(path: Path, execution: ProjectExecute, template, nodes: List[EadFmNodeRun]) -> None:

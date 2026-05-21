@@ -47,7 +47,7 @@ def test_ensure_materializes_after_publish_path(tmp_path: Path, monkeypatch: pyt
     )
     execution = store.get_execution("exec-pub")
     assert execution is not None
-    reports = build_and_persist_pfm_artifacts(execution, project_store=store)
+    reports = build_and_persist_pfm_artifacts(execution)
     store.update_execution("exec-pub", reports=reports)
     store.sync_execution_pfm_artifacts_from_state("exec-pub")
 

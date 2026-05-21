@@ -11,7 +11,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from .models import (
     EadFmNodeRun,
@@ -26,8 +26,6 @@ from .pfm_tree import strip_pfm_node_display_title
 
 def reports_root_dir() -> Path:
     configured = os.getenv("EAD_REPORT_DIR", "").strip()
-    if not configured:
-        configured = os.getenv("EAD_REPORT_BASE_DIR", "").strip()
     if configured:
         return Path(configured).expanduser()
     return Path.home() / ".hermes" / "projects" / "reports"
@@ -394,32 +392,23 @@ def _agent_authored_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
-def _defer_publish_bootstrap_from_progress(execution: ProjectExecute) -> bool:
-    """Same rule as deferring incremental snapshot for inherited RUNNING/PENDING runs."""
-    inherited_from = str(getattr(execution, "inherited_from_execution_id", "") or "").strip()
-    eid = str(getattr(execution, "id", "") or "").strip()
-    if not inherited_from or inherited_from == eid:
-        return False
-    raw_status = getattr(execution.status, "value", execution.status)
-    status = str(raw_status if raw_status is not None else "").strip().lower()
-    return status in ("running", "pending")
+def _load_committed_tree_runs(execution: ProjectExecute) -> Optional[List[EadFmNodeRun]]:
+    """Read the canonical pfm_tree artifact and return its flattened EadFmNodeRun list.
 
-
-def _committed_tree_as_runs_from_store(
-    store: Any,
-    execution_id: str,
-) -> Optional[List[EadFmNodeRun]]:
-    """Read the canonical ``pfm_tree`` artifact from *store* for this execution."""
+    Returns None when no tree has ever been committed for this execution. An empty
+    list indicates an explicit empty tree (treated upstream as "Awaiting first commit").
+    """
     try:
         from .pfm_tree import PFM_TREE_ARTIFACT_KEY, flat_nodes_to_ead_runs
+        from .store import ProjectStore
     except Exception:
         return None
 
-    eid = str(execution_id or "").strip()
-    if not eid or store is None or not hasattr(store, "get_execution_pfm_artifact"):
+    try:
+        store = ProjectStore()
+    except Exception:
         return None
-
-    artifact = store.get_execution_pfm_artifact(eid, PFM_TREE_ARTIFACT_KEY)
+    artifact = store.get_execution_pfm_artifact(execution.id, PFM_TREE_ARTIFACT_KEY)
     if not isinstance(artifact, dict):
         return None
     snap = artifact.get("snapshot")
@@ -431,68 +420,25 @@ def _committed_tree_as_runs_from_store(
     return flat_nodes_to_ead_runs(flat)
 
 
-def _load_committed_tree_runs(execution: ProjectExecute) -> Optional[List[EadFmNodeRun]]:
-    """Fallback when callers do not pass ``project_store`` (uses default ProjectStore path)."""
-    try:
-        from .store import ProjectStore
-
-        return _committed_tree_as_runs_from_store(ProjectStore(), execution.id)
-    except Exception:
-        return None
-
-
-def resolve_pfm_nodes_for_mindmap(
-    execution: ProjectExecute,
-    *,
-    project_store: Optional[Any] = None,
-) -> List[EadFmNodeRun]:
+def resolve_pfm_nodes_for_mindmap(execution: ProjectExecute) -> List[EadFmNodeRun]:
     """
-    Nodes used to generate the exported PFM mindmap / report payloads.
+    Nodes shown on the official PFM mindmap.
 
-    When EAD_PFM_AGENT_AUTHORED=true (default):
-        If a canonical ``pfm_tree`` exists for this execution, use it only —
-        faithfully reflects ``commit_pfm_snapshot``.
-
-        If **no** tree is committed yet, merge ``execution.results`` with
-        ``report_running_step`` PFM nodes from the progress log (same precedence
-        as legacy mode) **except** for inherited executions still RUNNING/PENDING:
-        those keep results-only semantics until an explicit snapshot/delivery ties
-        the run down, matching deferred DB bootstrap elsewhere.
-
-        This keeps publish outputs aligned with ``persist_pfm_tree_from_execution_state``
-        so ``publish_pfm_artifacts`` can auto-materialize before the first
-        ``commit_pfm_snapshot`` when progress signals exist.
-
-        When ``project_store`` is provided (Hermes tooling, tests), the committed-tree
-        probe uses that SQLite instance instead of constructing a bare ``ProjectStore()``.
+    Strict (default) mode driven by EAD_PFM_AGENT_AUTHORED:
+        Read only the agent-authored, committed pfm_tree artifact. Progress-text
+        fallbacks are intentionally excluded so the diagram is a faithful
+        rendering of what the agent declared via `commit_pfm_snapshot`.
 
     Legacy mode (EAD_PFM_AGENT_AUTHORED=false):
-        Merge ``execution.results`` with progress-derived nodes without the above staging rule.
+        Merge `execution.results` with progress-log inferred nodes, as in the
+        previous implementation. Retained for backward compatibility on installs
+        that have not yet rolled out the new tool.
     """
     if _agent_authored_enabled():
-        if project_store is not None:
-            committed = _committed_tree_as_runs_from_store(project_store, execution.id)
-        else:
-            committed = _load_committed_tree_runs(execution)
+        committed = _load_committed_tree_runs(execution)
         if committed is not None:
             return committed
-        if _defer_publish_bootstrap_from_progress(execution):
-            return list(execution.results or [])
-
-        stored = list(execution.results or [])
-        derived = derive_pfm_nodes_from_report_running_step_progress(execution.progress_log or [])
-        if not stored and not derived:
-            return derive_node_runs_from_progress(execution.progress_log or [])
-        if not stored:
-            return derived
-
-        stored_keys: Set[str] = {n.node_key for n in stored if getattr(n, "node_key", None)}
-        out = list(stored)
-        for node in derived:
-            if node.node_key and node.node_key not in stored_keys:
-                out.append(node)
-                stored_keys.add(node.node_key)
-        return out
+        return list(execution.results or [])
 
     stored = list(execution.results or [])
     derived = derive_pfm_nodes_from_report_running_step_progress(execution.progress_log or [])
@@ -726,12 +672,8 @@ def _try_upload_to_s3(local_path: Path, execution_id: str, filename: str) -> Opt
     return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
 
 
-def build_pfm_artifact_payloads(
-    execution: ProjectExecute,
-    *,
-    project_store: Optional[Any] = None,
-) -> List[Dict]:
-    nodes = resolve_pfm_nodes_for_mindmap(execution, project_store=project_store)
+def build_pfm_artifact_payloads(execution: ProjectExecute) -> List[Dict]:
+    nodes = resolve_pfm_nodes_for_mindmap(execution)
     created_at = int(time.time() * 1000)
     mindmap_name = "pfm-mindmap.mmd"
     report_name = "pfm-report.md"
@@ -764,16 +706,12 @@ def build_pfm_artifact_payloads(
     ]
 
 
-def build_and_persist_pfm_artifacts(
-    execution: ProjectExecute,
-    *,
-    project_store: Optional[Any] = None,
-) -> List[ProjectReportArtifact]:
+def build_and_persist_pfm_artifacts(execution: ProjectExecute) -> List[ProjectReportArtifact]:
     base_dir = reports_root_dir() / execution.id
     base_dir.mkdir(parents=True, exist_ok=True)
 
     reports = []
-    for payload in build_pfm_artifact_payloads(execution, project_store=project_store):
+    for payload in build_pfm_artifact_payloads(execution):
         filename = payload["filename"]
         path = base_dir / filename
         path.write_text(str(payload.get("content") or ""), encoding="utf-8")

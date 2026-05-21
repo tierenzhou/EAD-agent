@@ -64,14 +64,8 @@ def _is_terminal_execution_status(status: object) -> bool:
     }
 
 
-def _is_active_execution_status(status: object) -> bool:
-    value = str(getattr(status, "value", status) or "").strip().lower()
-    return value in {ExecutionStatus.PENDING.value, ExecutionStatus.RUNNING.value}
-
-
 _DEFAULT_DB_DIR = Path.home() / ".hermes" / "projects"
 _DEFAULT_DB_PATH = _DEFAULT_DB_DIR / "projects.db"
-_ACTIVE_CHAT_EXECUTION_KEY = "active_chat_execution_id"
 
 _SCHEMA_VERSION = 1
 
@@ -167,7 +161,7 @@ class ProjectStore:
         self._conn = sqlite3.connect(
             str(self.db_path),
             check_same_thread=False,
-            timeout=5.0,
+            timeout=1.0,
             isolation_level=None,
         )
         self._conn.row_factory = sqlite3.Row
@@ -279,14 +273,6 @@ class ProjectStore:
             return False
 
         def _write(conn):
-            conn.execute(
-                """
-                DELETE FROM active_state
-                WHERE key = ?
-                  AND value IN (SELECT id FROM executions WHERE linked_template_id = ?)
-                """,
-                (_ACTIVE_CHAT_EXECUTION_KEY, template_id),
-            )
             conn.execute("DELETE FROM template_pfm_artifacts WHERE template_id = ?", (template_id,))
             conn.execute("DELETE FROM template_learning_summaries WHERE template_id = ?", (template_id,))
             conn.execute("DELETE FROM execution_pfm_artifacts WHERE template_id = ?", (template_id,))
@@ -315,36 +301,6 @@ class ProjectStore:
 
         self._execute_write(_write)
 
-    def get_active_chat_delivery_execution_id(self) -> Optional[str]:
-        row = self._conn.execute(
-            "SELECT value FROM active_state WHERE key = ?",
-            (_ACTIVE_CHAT_EXECUTION_KEY,),
-        ).fetchone()
-        execution_id = str(row["value"] or "").strip() if row else ""
-        if not execution_id:
-            return None
-        # Self-heal stale pointers when the execution no longer exists.
-        if not self.get_execution(execution_id):
-            self.set_active_chat_delivery_execution_id(None)
-            return None
-        return execution_id
-
-    def set_active_chat_delivery_execution_id(self, execution_id: Optional[str]) -> None:
-        chosen = str(execution_id or "").strip()
-        if chosen and not self.get_execution(chosen):
-            chosen = ""
-
-        def _write(conn):
-            if not chosen:
-                conn.execute("DELETE FROM active_state WHERE key = ?", (_ACTIVE_CHAT_EXECUTION_KEY,))
-            else:
-                conn.execute(
-                    "INSERT OR REPLACE INTO active_state (key, value) VALUES (?, ?)",
-                    (_ACTIVE_CHAT_EXECUTION_KEY, chosen),
-                )
-
-        self._execute_write(_write)
-
     # ------------------------------------------------------------------
     # Execution CRUD
     # ------------------------------------------------------------------
@@ -367,52 +323,8 @@ class ProjectStore:
     def list_execution_payloads(
         self, template_id: Optional[str] = None, status: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Return lightweight execution list payloads without parsing large JSON blobs."""
-        query = """
-            SELECT
-                e.id,
-                e.linked_template_id,
-                e.status,
-                e.created_at,
-                json_extract(data, '$.name') AS name,
-                json_extract(data, '$.description') AS description,
-                json_extract(data, '$.target_url') AS target_url,
-                json_extract(data, '$.explore_type') AS explore_type,
-                json_extract(data, '$.run_session_key') AS run_session_key,
-                json_extract(data, '$.agent_run_id') AS agent_run_id,
-                json_extract(data, '$.paused') AS paused,
-                json_extract(data, '$.progress_percentage') AS progress_percentage,
-                json_extract(data, '$.start_time') AS start_time,
-                json_extract(data, '$.duration_ms') AS duration_ms,
-                json_extract(data, '$.executor_hint') AS executor_hint,
-                json_extract(data, '$.last_error_message') AS last_error_message,
-                json_extract(data, '$.cancel_reason') AS cancel_reason,
-                json_extract(data, '$.operator_stop_kind') AS operator_stop_kind,
-                json_extract(data, '$.reporting_activity_status') AS reporting_activity_status,
-                json_extract(data, '$.inherited_from_execution_id') AS inherited_from_execution_id,
-                json_extract(data, '$.bootstrap_pending') AS bootstrap_pending,
-                json_extract(data, '$.valid_for_data_reporting_training') AS valid_for_data_reporting_training,
-                json_extract(data, '$.contributes_to_learning') AS contributes_to_learning,
-                json_extract(data, '$.run_number') AS run_number,
-                json_array_length(json_extract(data, '$.reports')) AS report_count,
-                json_array_length(json_extract(data, '$.results')) AS result_count,
-                json_array_length(json_extract(data, '$.progress_log')) AS progress_log_count,
-                EXISTS(
-                    SELECT 1
-                    FROM execution_pfm_artifacts a
-                    WHERE a.execution_id = e.id
-                      AND a.artifact_key = 'pfm-tree.json'
-                ) AS pfm_has_committed_snapshot,
-                (
-                    SELECT json_extract(a.data, '$.snapshot.version')
-                    FROM execution_pfm_artifacts a
-                    WHERE a.execution_id = e.id
-                      AND a.artifact_key = 'pfm-tree.json'
-                    LIMIT 1
-                ) AS pfm_revision
-            FROM executions e
-            WHERE 1=1
-        """
+        """Return raw execution JSON payloads without Pydantic validation."""
+        query = "SELECT data FROM executions WHERE 1=1"
         params: List[Any] = []
         if template_id:
             query += " AND linked_template_id = ?"
@@ -423,48 +335,16 @@ class ProjectStore:
         query += " ORDER BY created_at DESC"
         rows = self._conn.execute(query, params).fetchall()
         out: List[Dict[str, Any]] = []
-        active_chat_execution_id = self.get_active_chat_delivery_execution_id() or ""
         for row in rows:
-            item = dict(row)
-            item["progress_log"] = []
-            item["results"] = []
-            item["reports"] = []
-            item["ai_prompt"] = ""
-            item["auth_instructions"] = ""
-            item["progress_log_seq"] = item.pop("progress_log_count", None) or 0
-            item["result_count"] = item.get("result_count") or 0
-            item["report_count"] = item.get("report_count") or 0
-            run_id = str(item.get("id") or "").strip()
-            has_tree = bool(item.get("pfm_has_committed_snapshot"))
-            item["pfm_has_committed_snapshot"] = has_tree
-            item["pfm_generation_version"] = item.get("run_number") or 0
-            item["pfm_revision"] = item.get("pfm_revision") or 0
-            item["pfm_snapshot_phase"] = (
-                "final"
-                if _is_terminal_execution_status(item.get("status"))
-                else ("evolving" if has_tree else "baseline_preview")
-            )
-            item["chat_delivery_active"] = (
-                bool(active_chat_execution_id)
-                and str(item.get("id") or "").strip() == active_chat_execution_id
-            )
-            # List view stays cheap (no per-run disk scans / full-template scans).
-            # GET /executions/{id} resolves accurate PFM lineage for the mindmap.
-            run_number = int(item.get("run_number") or 0)
-            inherited = str(item.get("inherited_from_execution_id") or "").strip()
-            if has_tree:
-                item["has_delivered_pfm_map_report"] = True
-                item["pfm_map_display_mode"] = "current"
-                item["pfm_tree_read_execution_id"] = run_id
-                item["pfm_baseline_execution_id"] = run_id
-                item["pfm_source_run_number"] = run_number
-            else:
-                item["has_delivered_pfm_map_report"] = False
-                item["pfm_map_display_mode"] = "previous"
-                item["pfm_tree_read_execution_id"] = inherited or None
-                item["pfm_baseline_execution_id"] = inherited or None
-                item["pfm_source_run_number"] = 0
-            out.append(item)
+            data_text = str(row["data"] or "").strip()
+            if not data_text:
+                continue
+            try:
+                parsed = json.loads(data_text)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                out.append(parsed)
         return out
 
     def get_execution(self, execution_id: str) -> Optional[ProjectExecute]:
@@ -478,11 +358,6 @@ class ProjectStore:
     def create_execution(self, execution: ProjectExecute) -> ProjectExecute:
         if _is_terminal_execution_status(execution.status):
             execution.reporting_activity_status = ReportingActivityStatus.CLOSED
-        from .pfm_run_number import ensure_template_run_numbers, next_run_number
-
-        ensure_template_run_numbers(self, execution.linked_template_id)
-        if int(getattr(execution, "run_number", 0) or 0) <= 0:
-            execution.run_number = next_run_number(self, execution.linked_template_id)
         data = execution.model_dump_json()
         created_at = execution.start_time or int(time.time() * 1000)
 
@@ -498,6 +373,9 @@ class ProjectStore:
                 execution.linked_template_id,
                 preferred_execution_id=execution.id,
             )
+        from .pfm_run_number import ensure_template_run_numbers
+
+        ensure_template_run_numbers(self, execution.linked_template_id)
         return self.get_execution(execution.id) or execution
 
     def update_execution(self, execution_id: str, **fields) -> Optional[ProjectExecute]:
@@ -558,8 +436,6 @@ class ProjectStore:
         self.ensure_single_active_reporting_execution(template_id)
         if self.list_executions(template_id=template_id):
             self.rebuild_template_learning_from_latest_good_run(template_id)
-        if self.get_active_chat_delivery_execution_id() == execution_id:
-            self.set_active_chat_delivery_execution_id(None)
         return True
 
     def get_active_reporting_execution_id(self, template_id: str) -> Optional[str]:
@@ -623,23 +499,19 @@ class ProjectStore:
         if not execution:
             return None
         if active:
-            self.set_active_chat_delivery_execution_id(execution_id)
-            preferred = str(execution_id or "").strip()
-            for run in self.list_executions():
-                target = (
-                    ReportingActivityStatus.ACTIVE
-                    if preferred and str(run.id or "").strip() == preferred
-                    else ReportingActivityStatus.CLOSED
-                )
-                if run.reporting_activity_status != target:
-                    self.update_execution(run.id, reporting_activity_status=target)
+            self.update_execution(
+                execution_id,
+                reporting_activity_status=ReportingActivityStatus.ACTIVE,
+            )
+            self.ensure_single_active_reporting_execution(
+                execution.linked_template_id,
+                preferred_execution_id=execution_id,
+            )
         else:
             self.update_execution(
                 execution_id,
                 reporting_activity_status=ReportingActivityStatus.CLOSED,
             )
-            if self.get_active_chat_delivery_execution_id() == execution_id:
-                self.set_active_chat_delivery_execution_id(None)
         return self.get_execution(execution_id)
 
     def close_terminal_reporting_activity(self) -> int:
@@ -656,29 +528,6 @@ class ProjectStore:
             )
             closed += 1
         return closed
-
-    def close_other_active_executions(
-        self,
-        preferred_execution_id: str,
-        *,
-        reason: str = "Closed automatically: only one project execution may run at a time.",
-    ) -> List[str]:
-        """Cancel any pending/running execution except the preferred global active run."""
-        preferred = str(preferred_execution_id or "").strip()
-        closed_ids: List[str] = []
-        for execution in self.get_active_executions():
-            if not execution.id or execution.id == preferred:
-                continue
-            self.update_execution(
-                execution.id,
-                status=ExecutionStatus.CANCELLED,
-                paused=False,
-                reporting_activity_status=ReportingActivityStatus.CLOSED,
-                operator_stop_kind="cancel",
-                cancel_reason=reason,
-            )
-            closed_ids.append(execution.id)
-        return closed_ids
 
     def set_execution_continuous_learning(
         self,
@@ -1248,7 +1097,7 @@ class ProjectStore:
         try:
             from .pfm_artifacts import build_pfm_artifact_payloads
 
-            for payload in build_pfm_artifact_payloads(execution, project_store=self):
+            for payload in build_pfm_artifact_payloads(execution):
                 artifact_key = str(payload.get("artifact_key") or payload.get("filename") or "").strip()
                 artifact_type = str(payload.get("artifact_type") or "").strip()
                 if not artifact_key or not artifact_type:
@@ -1315,41 +1164,6 @@ class ProjectStore:
         rows.sort()
         return rows
 
-    def _looks_degenerate_vs_baseline(
-        self,
-        execution: ProjectExecute,
-        nodes: List[EadFmNodeRun],
-    ) -> bool:
-        """
-        Guard against downgrading an inherited/baseline map into a shallow/noisy map.
-        """
-        if not nodes:
-            return True
-        try:
-            from .pfm_materialize import _results_titles_are_degenerate
-            from .pfm_tree import _is_junk_mindmap_node_title
-        except Exception:
-            return False
-
-        node_count = len(nodes)
-        bad_titles = sum(1 for n in nodes if _is_junk_mindmap_node_title(str(getattr(n, "title", "") or "")))
-        bad_ratio = (bad_titles / node_count) if node_count > 0 else 1.0
-        if node_count < 3 and _results_titles_are_degenerate(nodes):
-            return True
-        if bad_ratio >= 0.6:
-            return True
-
-        inherited_from = str(getattr(execution, "inherited_from_execution_id", "") or "").strip()
-        if not inherited_from:
-            return False
-        base_snap = self.get_committed_pfm_tree(inherited_from)
-        base_nodes = list((base_snap or {}).get("flat_nodes") or [])
-        if not base_nodes:
-            return False
-        if node_count < max(3, int(len(base_nodes) * 0.25)):
-            return True
-        return False
-
     def _should_defer_snapshot_from_inherited_results(self, execution: ProjectExecute) -> bool:
         """
         Active runs seeded from an inherited baseline should keep reading that baseline
@@ -1408,12 +1222,6 @@ class ProjectStore:
         nodes = list(execution.results or [])
         if not nodes:
             return {"ok": False, "code": "no_nodes", "message": "No run results available."}
-        if self._looks_degenerate_vs_baseline(execution, list(nodes)):
-            return {
-                "ok": False,
-                "code": "degenerate_snapshot_guard",
-                "message": "Candidate PFM tree is too weak/noisy versus inherited baseline; keep baseline until stronger findings are committed.",
-            }
 
         if self._results_signature(nodes) == self._snapshot_signature(prev_snap):
             version = int((prev_snap or {}).get("version") or 0)
@@ -1503,12 +1311,6 @@ class ProjectStore:
         nodes = _collect_nodes_for_materialize(self, execution)
         if not nodes:
             return {"ok": False, "code": "no_nodes", "message": "No PFM nodes available to materialize."}
-        if self._looks_degenerate_vs_baseline(execution, list(nodes)):
-            return {
-                "ok": False,
-                "code": "degenerate_snapshot_guard",
-                "message": "Candidate PFM tree is too weak/noisy versus inherited baseline; keep baseline until stronger findings are committed.",
-            }
 
         if prev_snap and self._results_signature(nodes) == self._snapshot_signature(prev_snap):
             version = int(prev_snap.get("version") or 0)
@@ -1647,20 +1449,12 @@ class ProjectStore:
             artifact_payload,
         )
 
-        update_exec_kw: Dict[str, Any] = {"results": flat_runs}
-        pend = str(getattr(execution, "pfm_refresh_pending_request_id", "") or "").strip()
-        if pend:
-            update_exec_kw["pfm_refresh_pending_request_id"] = None
-            update_exec_kw["pfm_refresh_satisfied_request_id"] = pend
-
-        updated = self.update_execution(execution.id, **update_exec_kw)
+        updated = self.update_execution(execution.id, results=flat_runs)
         execution = updated or execution
 
         report_artifacts = []
         try:
-            report_artifacts = build_and_persist_pfm_artifacts(
-                execution, project_store=self
-            )
+            report_artifacts = build_and_persist_pfm_artifacts(execution)
             self.update_execution(execution.id, reports=report_artifacts)
         except Exception as exc:
             logger.warning(
@@ -1793,14 +1587,6 @@ class ProjectStore:
 
         return snapshot_has_committed_tree(self._get_pfm_tree_snapshot_raw(execution_id))
 
-    def has_run_owned_current_pfm_map(
-        self, execution_id: str, *, check_disk: bool = True
-    ) -> bool:
-        """True when this run has DeliveredPFMMapReport (paired .pfm + .FMR for this run)."""
-        from .pfm_map_display import has_delivered_pfm_map_report
-
-        return has_delivered_pfm_map_report(self, execution_id, check_disk=check_disk)
-
     def compute_next_pfm_versioning(
         self, ex: ProjectExecute, prev_snap: Optional[Dict[str, Any]]
     ) -> tuple[int, int]:
@@ -1846,12 +1632,22 @@ class ProjectStore:
         return snapshot
 
     def resolve_pfm_baseline_execution_id(self, ex: ProjectExecute) -> Optional[str]:
-        """Prior finished run with valid map when this run has no DeliveredPFMMapReport."""
-        from .pfm_map_display import resolve_pfm_map_display
+        """Execution id to read committed PFM from when ``ex`` has no snapshot yet."""
+        if self.has_committed_pfm_tree(ex.id):
+            return None
+        from .pfm_run_number import prior_run_execution_id
 
-        ctx = resolve_pfm_map_display(self, ex)
-        baseline = str(ctx.get("pfm_baseline_execution_id") or "").strip()
-        return baseline or None
+        chron_prior = prior_run_execution_id(self, ex)
+        if chron_prior and chron_prior != ex.id and self.has_committed_pfm_tree(chron_prior):
+            return chron_prior
+        tmpl = self.get_template(ex.linked_template_id)
+        canon = (tmpl.canonical_pfm_execution_id or "").strip() if tmpl else ""
+        if canon and canon != ex.id and self.has_committed_pfm_tree(canon):
+            return canon
+        inh = (ex.inherited_from_execution_id or "").strip()
+        if inh and inh != ex.id and self.has_committed_pfm_tree(inh):
+            return inh
+        return None
 
     def _resolve_lineage_baseline_tree_version(self, ex: ProjectExecute) -> tuple[str, int]:
         """Find prior run with a committed tree for template lineage display (v9 → v10)."""
@@ -1897,10 +1693,62 @@ class ProjectStore:
         return best_id, best_gen
 
     def resolve_pfm_lineage_context(self, ex: ProjectExecute) -> Dict[str, Any]:
-        """Operator PFM map display: Current vs Previous (see ``pfm_map_display``)."""
-        from .pfm_map_display import resolve_pfm_map_display
+        """
+        Operator-facing PFM labels: V = run_number, Rev = within-run revision.
+        """
+        from .models import ExecutionStatus
+        from .pfm_run_number import get_run_number, prior_run_execution_id, prior_run_number
+        from .pfm_tree import snapshot_finalized, snapshot_revision
 
-        return resolve_pfm_map_display(self, ex)
+        has_own = self.has_committed_pfm_tree(ex.id)
+        own_snap = self.get_committed_pfm_tree(ex.id) if has_own else None
+        finalized = snapshot_finalized(own_snap)
+
+        generation = get_run_number(self, ex)
+        baseline_ver = prior_run_number(self, ex)
+        baseline_id = prior_run_execution_id(self, ex) or ""
+        if not baseline_id:
+            baseline_id = self.resolve_pfm_baseline_execution_id(ex) or ""
+
+        tree_read_id = ex.id if has_own else (self.resolve_pfm_baseline_execution_id(ex) or baseline_id or "")
+
+        revision = snapshot_revision(own_snap) if has_own else 0
+
+        status = (
+            ex.status.value
+            if isinstance(ex.status, ExecutionStatus)
+            else str(ex.status or "")
+        ).lower()
+        hint = str(ex.executor_hint or "").lower()
+        finalizing_hint = any(
+            token in hint
+            for token in ("reporting", "finalizing", "deliverable", "ai finish")
+        )
+
+        if not has_own:
+            phase = "baseline_preview"
+        elif status in ("completed", "failed", "cancelled", "error"):
+            phase = "final"
+        elif status in ("running", "pending") and finalizing_hint:
+            phase = "finalizing"
+        elif status in ("running", "pending"):
+            phase = "evolving"
+        else:
+            phase = "final"
+
+        return {
+            "run_number": generation,
+            "pfm_baseline_execution_id": baseline_id or None,
+            "pfm_tree_read_execution_id": tree_read_id or None,
+            "pfm_baseline_tree_version": baseline_ver,
+            "pfm_generation_version": generation,
+            "pfm_revision": revision,
+            "pfm_lineage_version": generation,
+            "pfm_step_version": revision,
+            "pfm_finalized": finalized,
+            "pfm_has_committed_snapshot": has_own,
+            "pfm_snapshot_phase": phase,
+        }
 
     def promote_template_canonical_pfm(
         self,
@@ -2373,14 +2221,12 @@ class ProjectStore:
     # ------------------------------------------------------------------
 
     def get_active_executions(self) -> List[ProjectExecute]:
-        executions = [
-            execution
-            for execution in self.list_executions()
-            if _is_active_execution_status(execution.status)
-            and execution.reporting_activity_status != ReportingActivityStatus.CLOSED
-        ]
-        return sorted(
-            executions,
-            key=lambda execution: int(execution.start_time or 0),
-            reverse=True,
+        active_statuses = (
+            self.list_executions(status=ExecutionStatus.RUNNING.value)
+            + self.list_executions(status=ExecutionStatus.PENDING.value)
         )
+        return [
+            execution
+            for execution in active_statuses
+            if execution.reporting_activity_status != ReportingActivityStatus.CLOSED
+        ]

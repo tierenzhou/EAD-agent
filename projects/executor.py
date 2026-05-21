@@ -28,7 +28,6 @@ from .pfm_artifacts import (
     resolve_pfm_nodes_for_mindmap,
 )
 from .pfm_deliverables import generate_pfm_deliverables
-from .pfm_node_report_standard import PFM_FMR_DELIVERY_AGENT_INSTRUCTIONS
 from .pfm_tree import (
     PFM_HIERARCHY_READABILITY_RULES,
     PFM_NODE_TITLE_RULES,
@@ -59,12 +58,12 @@ _RECOVERY_WINDOW_S = 600
 _POLL_INTERVAL_S = 1.2
 _PROGRESS_REPORT_INTERVAL_S = 15
 _STALL_INTERRUPT_S = 90.0
-# Timed regeneration/persist of PFM artifacts while a run is active. Default is 5 minutes
-# so DB-backed mindmap revisions continue even when the agent misses explicit commit calls.
-# Override with EAD_PFM_PERIODIC_SYNC_S (set to 0/false to disable).
+# Optional timed regeneration of published PFM artifacts (accuracy still comes primarily
+# from progress-driven sync + terminal force-sync). 0/disabled by default — set e.g.
+# EAD_PFM_PERIODIC_SYNC_S=600 for 10-minute watchdog refreshes.
 # Optional: EAD_PFM_SYNC_SNAPSHOT_FROM_RESULTS (default on) — after each progress-driven PFM sync,
 # persist an updated pfm-tree.json from execution.results when the agent did not call commit_pfm_snapshot.
-_raw_periodic = (os.getenv("EAD_PFM_PERIODIC_SYNC_S", "300") or "").strip().lower()
+_raw_periodic = (os.getenv("EAD_PFM_PERIODIC_SYNC_S", "0") or "").strip().lower()
 if _raw_periodic in ("", "0", "false", "off", "no"):
     _PFM_PERIODIC_SYNC_S = 0.0
 else:
@@ -77,8 +76,6 @@ else:
 _PFM_REFRESH_NUDGE_MIN_INTERVAL_S = 4.0
 # When no committed mindmap exists yet, re-prompt an idle agent on this interval.
 _AUTOMATIC_MINDMAP_NUDGE_MIN_S = 45.0
-# Canonical delivery fingerprint scans can be expensive; throttle background checks.
-_DELIVERY_REFRESH_SCAN_INTERVAL_S = 8.0
 
 _LOGIN_PHASE_PROMPT = (
     "LOGIN PHASE (MANDATORY, FIRST):\n"
@@ -245,7 +242,6 @@ _PFM_SNAPSHOT_COMMIT_PROMPT = (
     "- This commit is what end users see in the UI mindmap and what future runs inherit. Do not "
     "describe the tree only in chat prose -- a chat answer that is not also committed via "
     "commit_pfm_snapshot does NOT update the saved mindmap.\n"
-    + PFM_FMR_DELIVERY_AGENT_INSTRUCTIONS
 )
 
 _PROGRESS_MESSAGE_PREFIX = "📊 Progress Update"
@@ -415,8 +411,6 @@ class ProjectExecutor:
         self._last_progress_seq_seen: Dict[str, int] = {}
         self._last_progress_activity_ts: Dict[str, float] = {}
         self._last_pfm_periodic_ts: Dict[str, float] = {}
-        self._last_delivery_refresh_fingerprint: Dict[str, str] = {}
-        self._last_delivery_refresh_scan_ts: Dict[str, float] = {}
         self._pfm_refresh_nudge_ts: Dict[str, float] = {}
         self._automatic_mindmap_nudge_ts: Dict[str, float] = {}
 
@@ -583,42 +577,6 @@ class ProjectExecutor:
             run_id,
         )
 
-    def _maybe_periodic_api_commit_nudge(self, execution_id: str, execution: ProjectExecute) -> None:
-        """
-        Periodic (cadenced) reminder: ask the agent to persist via API tools.
-
-        Keeps commit behavior explicit even when fallback materialization also exists.
-        """
-        if execution.status != ExecutionStatus.RUNNING:
-            return
-        if execution.bootstrap_pending:
-            return
-        if not self._is_login_successful(execution):
-            return
-        sk = (execution.run_session_key or "").strip()
-        if not sk or self._pool.is_agent_active(sk):
-            return
-
-        boundary = self._project_boundary_prompt(execution)
-        user_message = (
-            "[PFM cadence reminder] Please persist this run's latest findings via API tools now. "
-            f"Execution: {execution_id}. "
-            "1) Call **commit_pfm_snapshot** with the current tree (version must increase if already committed). "
-            "2) Call **publish_pfm_artifacts** after commit so reports/mindmap files stay aligned. "
-            "If no meaningful map change exists, reply briefly and continue exploration."
-        )
-        run_id = self._pool.send_message_async(
-            session_key=sk,
-            user_message=user_message,
-            ephemeral_system_prompt=boundary,
-            enable_tools=True,
-        )
-        logger.info(
-            "[executor] Periodic API commit nudge for execution %s (async run %s)",
-            execution_id,
-            run_id,
-        )
-
     async def start_execution(self, execution_id: str) -> None:
         if self.has_active_monitor(execution_id):
             logger.info(
@@ -711,25 +669,7 @@ class ProjectExecutor:
         except Exception as exc:
             logger.debug("[executor] Terminal reporting cleanup failed on startup: %s", exc)
 
-        active_executions = list(self._store.get_active_executions() or [])
-        if len(active_executions) > 1:
-            keep = active_executions[0]
-            closed_ids = self._store.close_other_active_executions(
-                keep.id,
-                reason=(
-                    "Closed on gateway startup: only one project execution may run "
-                    "at a time."
-                ),
-            )
-            if closed_ids:
-                logger.info(
-                    "[executor] Closed %d extra active execution(s) on startup; keeping %s",
-                    len(closed_ids),
-                    keep.id,
-                )
-            active_executions = list(self._store.get_active_executions() or [])
-
-        for execution in active_executions:
+        for execution in self._store.get_active_executions():
             execution_id = execution.id
             pending = execution.status == ExecutionStatus.PENDING
             has_key = bool((execution.run_session_key or "").strip())
@@ -822,7 +762,6 @@ class ProjectExecutor:
                         and self._is_login_successful(exec_now)
                         and (now_ts - last_pf >= _PFM_PERIODIC_SYNC_S)
                     ):
-                        self._maybe_periodic_api_commit_nudge(execution_id, exec_now)
                         await self._sync_pfm_artifacts(execution_id, force=True)
                         self._last_pfm_periodic_ts[execution_id] = now_ts
 
@@ -931,8 +870,6 @@ class ProjectExecutor:
         self._last_progress_seq_seen.pop(execution_id, None)
         self._last_progress_activity_ts.pop(execution_id, None)
         self._last_pfm_periodic_ts.pop(execution_id, None)
-        self._last_delivery_refresh_fingerprint.pop(execution_id, None)
-        self._last_delivery_refresh_scan_ts.pop(execution_id, None)
         self._pfm_refresh_nudge_ts.pop(execution_id, None)
         self._automatic_mindmap_nudge_ts.pop(execution_id, None)
 
@@ -1317,10 +1254,9 @@ class ProjectExecutor:
         count = self._auto_continue_counts.get(execution_id, 0)
         if count >= _MAX_AUTO_CONTINUES:
             logger.info("[executor] Max auto-continues reached for %s", execution_id)
-            await self.cancel_execution(
+            self._store.update_execution(
                 execution_id,
-                final_status=ExecutionStatus.COMPLETED,
-                operator_stop_kind="finish",
+                status=ExecutionStatus.COMPLETED,
                 cancel_reason="max_auto_continues_reached",
             )
             return
@@ -1525,14 +1461,10 @@ class ProjectExecutor:
                     executor_hint="Reporting...",
                 )
                 await self._sync_pfm_artifacts(execution_id, force=True)
-                await self.cancel_execution(
-                    execution_id,
-                    final_status=ExecutionStatus.COMPLETED,
-                    operator_stop_kind="finish",
-                    cancel_reason="time_budget_exceeded",
-                )
                 self._store.update_execution(
                     execution_id,
+                    status=ExecutionStatus.COMPLETED,
+                    cancel_reason="time_budget_exceeded",
                     duration_ms=elapsed_ms,
                     progress_percentage=100,
                     executor_hint="AI Finish",
@@ -1551,20 +1483,12 @@ class ProjectExecutor:
         if not session_id:
             return
 
-        seq = int(execution.progress_log_seq or 0)
-        try:
-            # Fast-path: avoid loading full transcript when no new messages arrived.
-            total_messages = int(db.message_count(session_id))
-            if total_messages <= seq:
-                return
-        except Exception:
-            total_messages = None
-
         try:
             messages = db.get_messages(session_id)
         except Exception:
             return
 
+        seq = execution.progress_log_seq or 0
         new_messages = messages[seq:]
         if not new_messages:
             return
@@ -1677,7 +1601,7 @@ class ProjectExecutor:
         if progress_entries:
             current_log = execution.progress_log or []
             updated_log = current_log + progress_entries
-            msg_count = total_messages if isinstance(total_messages, int) else len(messages)
+            msg_count = len(messages)
 
             update_fields = {
                 "progress_log": updated_log,
@@ -1695,8 +1619,6 @@ class ProjectExecutor:
         if not execution:
             return
 
-        self._maybe_refresh_from_new_delivery(execution_id, force=force)
-
         seq = int(execution.progress_log_seq or 0)
         if not force and self._last_pfm_sync_seq.get(execution_id) == seq:
             return
@@ -1709,14 +1631,14 @@ class ProjectExecutor:
         # If the run did not produce structured node results yet, derive a live
         # placeholder map from transcript progress so the UI mindmap can update in real time.
         if login_success and not execution.results:
-            merged = resolve_pfm_nodes_for_mindmap(execution, project_store=self._store)
+            merged = resolve_pfm_nodes_for_mindmap(execution)
             if merged:
                 self._store.update_execution(execution_id, results=merged)
                 refreshed = self._store.get_execution(execution_id)
                 if refreshed:
                     execution = refreshed
 
-        reports = build_and_persist_pfm_artifacts(execution, project_store=self._store)
+        reports = build_and_persist_pfm_artifacts(execution)
         self._store.update_execution(execution_id, reports=reports)
         self._store.sync_execution_pfm_artifacts_from_state(execution_id)
         self._last_pfm_sync_seq[execution_id] = seq
@@ -1743,28 +1665,6 @@ class ProjectExecutor:
                     and not has_own_committed
                 )
                 if defer_force_materialize:
-                    try:
-                        # Allow periodic DB revisions for inherited active runs once they diverge
-                        # from baseline results. Keep deferral while still equal to inherited tree.
-                        source_id = str(getattr(execution, "inherited_from_execution_id", "") or "").strip()
-                        source_snap = self._store.get_committed_pfm_tree(source_id) if source_id else None
-                        curr_results = list(getattr(execution, "results", None) or [])
-                        if (
-                            source_snap
-                            and curr_results
-                            and hasattr(self._store, "_results_signature")
-                            and hasattr(self._store, "_snapshot_signature")
-                        ):
-                            same_as_baseline = (
-                                self._store._results_signature(curr_results)
-                                == self._store._snapshot_signature(source_snap)
-                            )
-                            if not same_as_baseline:
-                                defer_force_materialize = False
-                    except Exception:
-                        pass
-
-                if defer_force_materialize:
                     logger.info(
                         "[executor] Skip force snapshot materialize for inherited active run %s; "
                         "waiting for run-owned .pfm/.FMR delivery or explicit commit.",
@@ -1784,98 +1684,20 @@ class ProjectExecutor:
                     exc,
                 )
 
-    def _maybe_refresh_from_new_delivery(self, execution_id: str, *, force: bool = False) -> None:
-        """
-        Fallback fast-path: if canonical delivery files changed on disk, persist immediately.
-
-        This runs independently of progress-log sequence so a delivery can be committed even when
-        no new progress rows were emitted.
-        """
-        from .pfm_delivery import compute_canonical_delivery_stamp
-        from .pfm_refresh import try_refresh_pfm_from_delivery
-
-        if not force:
-            now = time.time()
-            last_scan = float(self._last_delivery_refresh_scan_ts.get(execution_id, 0.0) or 0.0)
-            if now - last_scan < _DELIVERY_REFRESH_SCAN_INTERVAL_S:
-                return
-            self._last_delivery_refresh_scan_ts[execution_id] = now
-
-        stamp = compute_canonical_delivery_stamp(execution_id)
-        fp = str(stamp.get("fingerprint") or "").strip()
-        if not fp:
-            if force:
-                self._last_delivery_refresh_fingerprint.pop(execution_id, None)
-            return
-
-        if not force and self._last_delivery_refresh_fingerprint.get(execution_id) == fp:
-            return
-
-        out = try_refresh_pfm_from_delivery(
-            self._store,
-            execution_id,
-            promote_template_canonical=False,
-        )
-        code = str(out.get("code") or "").strip()
-
-        # Record this fingerprint as processed to avoid repeated refresh churn.
-        self._last_delivery_refresh_fingerprint[execution_id] = fp
-
-        if bool(out.get("ok")) and code == "materialized":
-            logger.info(
-                "[executor] Immediate delivery refresh persisted for %s (fp=%s...)",
-                execution_id,
-                fp[:12],
-            )
-        elif bool(out.get("ok")) and code == "no_changes":
-            logger.debug(
-                "[executor] Immediate delivery refresh no-op for %s (unchanged delivery)",
-                execution_id,
-            )
-        elif not bool(out.get("ok")):
-            logger.warning(
-                "[executor] Immediate delivery refresh failed for %s: %s (%s)",
-                execution_id,
-                code or "error",
-                str(out.get("message") or ""),
-            )
-
     async def _finalize_completed_execution(self, execution_id: str) -> None:
         execution = self._store.get_execution(execution_id)
         if not execution or execution.status != ExecutionStatus.COMPLETED:
             return
 
-        commit_blocking_reason = ""
         try:
             committed_tree = self._store.get_committed_pfm_tree(execution_id)
             if not committed_tree:
-                persist = self._store.persist_pfm_tree_from_execution_state(execution_id)
-                code = str(persist.get("code") or "").strip()
-                if bool(persist.get("ok")) and code == "materialized":
-                    committed_tree = self._store.get_committed_pfm_tree(execution_id)
-                    logger.info(
-                        "[executor] Finalize: auto-materialized missing pfm_tree for %s at completion.",
-                        execution_id,
-                    )
-                else:
-                    commit_blocking_reason = (
-                        f"No committed PFM tree at finalize (persist code={code or 'unknown'}). "
-                        "Agent must call commit_pfm_snapshot, or emit report_running_step pfm_node "
-                        "signals then republish."
-                    )
-                    logger.warning(
-                        "[executor] %s execution_id=%s message=%s",
-                        commit_blocking_reason,
-                        execution_id,
-                        str(persist.get("message") or ""),
-                    )
-                    self._store.update_execution(
-                        execution_id,
-                        executor_hint=(
-                            "Run completed, but PFM map is not committed yet. "
-                            "Please run commit_pfm_snapshot (or provide PFM node signals) and refresh."
-                        ),
-                    )
+                logger.warning(
+                    "[executor] Execution %s completed without a committed PFM tree snapshot; "
+                    "mindmap will show 'Awaiting first commit'. Ensure the agent calls "
+                    "commit_pfm_snapshot during/before exploration ends.",
+                    execution_id,
+                )
             else:
                 logger.info(
                     "[executor] Finalize: execution %s has pfm_tree v%s with %s nodes.",
@@ -1887,9 +1709,6 @@ class ProjectExecutor:
             logger.debug(
                 "[executor] get_committed_pfm_tree check failed for %s: %s", execution_id, exc
             )
-
-        if commit_blocking_reason:
-            return
 
         try:
             deliverables = generate_pfm_deliverables(self._store, execution_id)
@@ -1919,7 +1738,6 @@ class ProjectExecutor:
                 execution_id,
                 exc,
             )
-        self._close_reporting_activity(execution_id)
 
     async def _report_progress_to_chat(self, execution_id: str, session_key: str) -> None:
         # User requested agent-native updates only; suppress executor-authored chat summaries.
@@ -2113,24 +1931,6 @@ class ProjectExecutor:
         operator_stop_kind: Optional[str] = None,
         cancel_reason: Optional[str] = None,
     ) -> None:
-        if final_status == ExecutionStatus.COMPLETED:
-            allowed, detail = self._ensure_committed_pfm_for_completion(execution_id)
-            if not allowed:
-                final_status = ExecutionStatus.CANCELLED
-                base = str(cancel_reason or "").strip()
-                detail_txt = detail or "missing_committed_pfm_tree"
-                cancel_reason = (
-                    f"{base}; completion_blocked:{detail_txt}"
-                    if base
-                    else f"completion_blocked:{detail_txt}"
-                )
-                logger.warning(
-                    "[executor] Blocking COMPLETED for %s because committed pfm_tree is missing (%s). "
-                    "Run is marked CANCELLED instead.",
-                    execution_id,
-                    detail_txt,
-                )
-
         self._cancelled.add(execution_id)
         event = self._abort_events.get(execution_id)
         if event:
@@ -2167,22 +1967,6 @@ class ProjectExecutor:
             final_status.value,
             operator_stop_kind or "ai",
         )
-
-    def _ensure_committed_pfm_for_completion(self, execution_id: str) -> tuple[bool, str]:
-        """
-        Completion gate: runs may become COMPLETED only with a committed pfm_tree.
-        """
-        try:
-            snap = self._store.get_committed_pfm_tree(execution_id)
-            if snap:
-                return True, ""
-
-            out = self._store.persist_pfm_tree_from_execution_state(execution_id)
-            if bool(out.get("ok")) and str(out.get("code") or "").strip() == "materialized":
-                return bool(self._store.get_committed_pfm_tree(execution_id)), "materialized"
-            return False, str(out.get("code") or "persist_failed")
-        except Exception as exc:
-            return False, f"exception:{exc}"
 
     async def pause_execution(self, execution_id: str) -> None:
         execution = self._store.get_execution(execution_id)

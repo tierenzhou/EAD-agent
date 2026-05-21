@@ -488,7 +488,6 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
-        enabled_toolsets: Optional[list[str]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -510,9 +509,7 @@ class APIServerAdapter(BasePlatformAdapter):
         model = _resolve_gateway_model()
 
         user_config = _load_gateway_config()
-        platform_toolsets = set(_get_platform_tools(user_config, "api_server"))
-        requested_toolsets = {str(t).strip() for t in (enabled_toolsets or []) if str(t).strip()}
-        enabled_toolsets = sorted(platform_toolsets | requested_toolsets)
+        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -1935,17 +1932,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         agent_pool=self._agent_pool,
                     )
                     self._project_handlers._executor = self._executor
-                    async def _deferred_resume_active_executions() -> None:
-                        # Let /health and the UI come up before monitor/bootstrap work.
-                        await asyncio.sleep(2.0)
-                        try:
-                            await self._executor.resume_active_executions()
-                        except Exception as exc:
-                            logger.exception(
-                                "[api_server] resume_active_executions failed: %s", exc
-                            )
-
-                    asyncio.create_task(_deferred_resume_active_executions())
+                    asyncio.create_task(self._executor.resume_active_executions())
                     logger.info("[api_server] ProjectExecutor wired (store + agent_pool)")
             except Exception as e:
                 logger.warning("[api_server] Chat control API not available: %s", e)
